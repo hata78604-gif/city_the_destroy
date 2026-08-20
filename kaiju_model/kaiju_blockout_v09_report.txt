@@ -1,0 +1,25 @@
+STEP3-v09 Tail Spine + Stronger Forward Knee + Longer Face Report
+Status: PASS
+Scope: tail spines, knee bend, downward-tilted head and teeth; v08 elbows preserved
+Blender: 5.2.0 LTS
+Forward axis: -Y
+Bounds min: (-2.73, -3.82, 0.00)
+Bounds max: (2.73, 8.00, 10.00)
+Dimensions XYZ: (5.46, 11.82, 10.00) m
+Knee/leg anchors (left; right is mirrored):
+  Hip:   (1.08, 0.62, 4.94)
+  Knee:  (1.24, 0.06, 2.76)
+  Ankle: (1.14, 0.30, 0.70)
+Knee bend direction: forward (-Y), PASS
+Shin return direction: rearward (+Y), PASS
+Tail spine count: 8
+Tail spine placement: Tail_Base through Tail_07, centered X=0, embedded, shrinking to tip, PASS
+Eye visibility: Eye_L/Eye_R exposed beneath brows with red emissive material, PASS
+Head pitch: snout front lowered for a downward crocodilian angle, PASS
+Teeth: upper/lower rows added and visible in front/side views, PASS
+Validation: PASS
+Self-evaluation:
+  1. Tail spines: PASS
+  2. Forward knee bend: PASS
+  3. Elbow bend: PASS (preserved v08)
+  4. Crocodilian face: PASS (longer low snout from v07)

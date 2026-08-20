@@ -1,0 +1,996 @@
+local Selection = game:GetService("Selection")
+
+--------------------------------------------------------------------
+-- 基本設定
+--------------------------------------------------------------------
+
+-- 1つの元Partを最大何個程度に分割するか
+local MAX_BLOCKS_PER_PART = 12
+
+-- これより小さいPartは分割せず、そのままコピー
+-- 「どれか1辺がこの値以上」なら分割候補
+local MIN_SPLIT_SIZE = 15
+
+-- 元の建物を残す
+local KEEP_ORIGINAL = true
+
+--------------------------------------------------------------------
+-- 家具・内装除外設定
+--------------------------------------------------------------------
+
+-- 家具除外機能を使う
+local REMOVE_INTERIOR_PROPS = true
+
+-- true:
+--   ボクセル化は行わず、家具候補だけ選択する
+--
+-- false:
+--   家具候補を除外してVoxelizedBuildingを生成する
+local PREVIEW_ONLY = false
+
+-- 建物外周から何Stud以内を「外殻」とみなすか
+--
+-- X/Z方向だけ判定する。
+-- Y方向を判定すると、床に置かれた家具まで
+-- 「外殻」と認識されるため使わない。
+local SHELL_MARGIN = 20
+
+-- 名前が分からないPartでも、
+-- 建物内部にあってこのサイズ以下なら家具候補
+local MAX_INTERIOR_PROP_WIDTH = 12
+local MAX_INTERIOR_PROP_HEIGHT = 12
+
+--------------------------------------------------------------------
+-- 名前で家具と判断する単語
+--
+-- Part自身だけではなく、
+-- 親Modelの名前も調べる。
+--
+-- 例:
+--
+-- Chair
+--   ├ Part
+--   ├ Part
+--   └ MeshPart
+--
+-- のような構造でも除外できる。
+--------------------------------------------------------------------
+
+local PROP_NAME_WORDS = {
+	"chair",
+	"seat",
+	"table",
+	"desk",
+	"sofa",
+	"couch",
+	"stool",
+	"bench",
+	"bed",
+
+	"cabinet",
+	"shelf",
+	"bookshelf",
+	"dresser",
+	"wardrobe",
+
+	"lamp",
+	"lightfixture",
+
+	"television",
+	"tv",
+	"monitor",
+	"computer",
+
+	"fridge",
+	"refrigerator",
+	"microwave",
+	"oven",
+
+	"toilet",
+	"sink",
+	"bathtub",
+
+	"furniture",
+	"appliance",
+}
+
+--------------------------------------------------------------------
+-- 名前で建築物として保護する単語
+--
+-- 小さくても消してはいけない構造物。
+--------------------------------------------------------------------
+
+local STRUCTURE_NAME_WORDS = {
+	"wall",
+	"floor",
+	"roof",
+	"ceiling",
+
+	"door",
+	"window",
+
+	"stair",
+	"stairs",
+	"step",
+
+	"column",
+	"pillar",
+	"beam",
+
+	"foundation",
+
+	"railing",
+	"rail",
+
+	"balcony",
+	"porch",
+
+	"frame",
+	"trim",
+}
+
+--------------------------------------------------------------------
+-- 前回残った空の VoxelizedBuilding を掃除
+--------------------------------------------------------------------
+
+local removedEmptyModels = 0
+
+for _, obj in ipairs(workspace:GetChildren()) do
+	if obj:IsA("Model")
+		and obj.Name == "VoxelizedBuilding"
+		and #obj:GetChildren() == 0 then
+
+		obj:Destroy()
+		removedEmptyModels += 1
+	end
+end
+
+if removedEmptyModels > 0 then
+	print(
+		("空のVoxelizedBuildingを %d 個削除しました")
+			:format(removedEmptyModels)
+	)
+end
+
+--------------------------------------------------------------------
+-- 選択確認
+--------------------------------------------------------------------
+
+local selected = Selection:Get()
+
+if #selected == 0 then
+	warn("分割したいPartまたはModelを選択してください")
+	return
+end
+
+--------------------------------------------------------------------
+-- 名前判定
+--------------------------------------------------------------------
+
+local function containsWord(name, words)
+	local lowerName = string.lower(name)
+
+	for _, word in ipairs(words) do
+		if string.find(lowerName, word, 1, true) then
+			return true
+		end
+	end
+
+	return false
+end
+
+--------------------------------------------------------------------
+-- Part自身と親Modelの名前を調べる
+--------------------------------------------------------------------
+
+local function ancestorContainsWord(part, root, words)
+	local current = part
+
+	while current do
+		if containsWord(current.Name, words) then
+			return true
+		end
+
+		if current == root then
+			break
+		end
+
+		current = current.Parent
+	end
+
+	return false
+end
+
+--------------------------------------------------------------------
+-- 選択オブジェクト内のBasePart一覧
+--------------------------------------------------------------------
+
+local function getParts(obj)
+	local parts = {}
+
+	if obj:IsA("BasePart") then
+		table.insert(parts, obj)
+		return parts
+	end
+
+	for _, descendant in ipairs(obj:GetDescendants()) do
+		if descendant:IsA("BasePart") then
+			table.insert(parts, descendant)
+		end
+	end
+
+	return parts
+end
+
+--------------------------------------------------------------------
+-- BoundingBox取得
+--
+-- Model:
+--   RobloxのGetBoundingBoxを使用
+--
+-- Folder:
+--   ワールド座標基準のBoundingBoxを作る
+--------------------------------------------------------------------
+
+local function getBounds(obj, parts)
+	if obj:IsA("BasePart") then
+		return obj.CFrame, obj.Size
+	end
+
+	if obj:IsA("Model") then
+		return obj:GetBoundingBox()
+	end
+
+	if #parts == 0 then
+		return nil, nil
+	end
+
+	----------------------------------------------------------------
+	-- Folder用
+	-- Partの8頂点からワールドAABBを作る
+	----------------------------------------------------------------
+
+	local minX = math.huge
+	local minY = math.huge
+	local minZ = math.huge
+
+	local maxX = -math.huge
+	local maxY = -math.huge
+	local maxZ = -math.huge
+
+	for _, part in ipairs(parts) do
+		local half = part.Size / 2
+
+		for _, x in ipairs({ -1, 1 }) do
+			for _, y in ipairs({ -1, 1 }) do
+				for _, z in ipairs({ -1, 1 }) do
+
+					local corner =
+						part.CFrame
+						* Vector3.new(
+							half.X * x,
+							half.Y * y,
+							half.Z * z
+						)
+
+					minX = math.min(minX, corner.X)
+					minY = math.min(minY, corner.Y)
+					minZ = math.min(minZ, corner.Z)
+
+					maxX = math.max(maxX, corner.X)
+					maxY = math.max(maxY, corner.Y)
+					maxZ = math.max(maxZ, corner.Z)
+				end
+			end
+		end
+	end
+
+	local center = Vector3.new(
+		(minX + maxX) / 2,
+		(minY + maxY) / 2,
+		(minZ + maxZ) / 2
+	)
+
+	local size = Vector3.new(
+		maxX - minX,
+		maxY - minY,
+		maxZ - minZ
+	)
+
+	return CFrame.new(center), size
+end
+
+--------------------------------------------------------------------
+-- PartをBoundingBox座標へ変換して
+-- Partの最小/最大位置を求める
+--------------------------------------------------------------------
+
+local function getPartExtentsInBounds(part, boundsCFrame)
+	local half = part.Size / 2
+
+	local minX = math.huge
+	local minY = math.huge
+	local minZ = math.huge
+
+	local maxX = -math.huge
+	local maxY = -math.huge
+	local maxZ = -math.huge
+
+	for _, x in ipairs({ -1, 1 }) do
+		for _, y in ipairs({ -1, 1 }) do
+			for _, z in ipairs({ -1, 1 }) do
+
+				local worldCorner =
+					part.CFrame
+					* Vector3.new(
+						half.X * x,
+						half.Y * y,
+						half.Z * z
+					)
+
+				local localCorner =
+					boundsCFrame:PointToObjectSpace(worldCorner)
+
+				minX = math.min(minX, localCorner.X)
+				minY = math.min(minY, localCorner.Y)
+				minZ = math.min(minZ, localCorner.Z)
+
+				maxX = math.max(maxX, localCorner.X)
+				maxY = math.max(maxY, localCorner.Y)
+				maxZ = math.max(maxZ, localCorner.Z)
+			end
+		end
+	end
+
+	return {
+		minX = minX,
+		maxX = maxX,
+
+		minY = minY,
+		maxY = maxY,
+
+		minZ = minZ,
+		maxZ = maxZ,
+	}
+end
+
+--------------------------------------------------------------------
+-- 建物外周に近いか
+--
+-- X/Z方向だけを見る。
+--------------------------------------------------------------------
+
+local function isNearOuterShell(part, boundsCFrame, boundsSize)
+	local extents =
+		getPartExtentsInBounds(
+			part,
+			boundsCFrame
+		)
+
+	local halfX = boundsSize.X / 2
+	local halfZ = boundsSize.Z / 2
+
+	local distanceLeft =
+		extents.minX + halfX
+
+	local distanceRight =
+		halfX - extents.maxX
+
+	local distanceFront =
+		extents.minZ + halfZ
+
+	local distanceBack =
+		halfZ - extents.maxZ
+
+	local nearestHorizontalEdge =
+		math.min(
+			distanceLeft,
+			distanceRight,
+			distanceFront,
+			distanceBack
+		)
+
+	return nearestHorizontalEdge <= SHELL_MARGIN
+end
+
+--------------------------------------------------------------------
+-- 小物サイズか
+--------------------------------------------------------------------
+
+local function isSmallInteriorPart(part)
+	local size = part.Size
+
+	local horizontalSize =
+		math.max(
+			size.X,
+			size.Z
+		)
+
+	return horizontalSize <= MAX_INTERIOR_PROP_WIDTH
+		and size.Y <= MAX_INTERIOR_PROP_HEIGHT
+end
+
+--------------------------------------------------------------------
+-- 家具候補判定
+--------------------------------------------------------------------
+
+local function shouldRemoveAsProp(
+	part,
+	root,
+	boundsCFrame,
+	boundsSize
+)
+
+	if not REMOVE_INTERIOR_PROPS then
+		return false, nil
+	end
+
+	----------------------------------------------------------------
+	-- 建築物名なら絶対保護
+	----------------------------------------------------------------
+
+	if ancestorContainsWord(
+		part,
+		root,
+		STRUCTURE_NAME_WORDS
+	) then
+
+		return false, "protected_structure"
+	end
+
+	----------------------------------------------------------------
+	-- Seat / VehicleSeat は家具として扱う
+	----------------------------------------------------------------
+
+	if part:IsA("Seat")
+		or part:IsA("VehicleSeat") then
+
+		return true, "seat_class"
+	end
+
+	----------------------------------------------------------------
+	-- 名前で家具判定
+	----------------------------------------------------------------
+
+	if ancestorContainsWord(
+		part,
+		root,
+		PROP_NAME_WORDS
+	) then
+
+		return true, "prop_name"
+	end
+
+	----------------------------------------------------------------
+	-- 外周付近なら建物の構造物として残す
+	----------------------------------------------------------------
+
+	if isNearOuterShell(
+		part,
+		boundsCFrame,
+		boundsSize
+	) then
+
+		return false, "outer_shell"
+	end
+
+	----------------------------------------------------------------
+	-- 内部 + 小さいPart
+	--
+	-- 名前がPart / MeshPartなどでも
+	-- 椅子・机の部品を除外できる
+	----------------------------------------------------------------
+
+	if isSmallInteriorPart(part) then
+		return true, "small_interior"
+	end
+
+	return false, nil
+end
+
+--------------------------------------------------------------------
+-- 出力Model
+--------------------------------------------------------------------
+
+local output = nil
+
+if not PREVIEW_ONLY then
+	output = Instance.new("Model")
+
+	-- 選択した元オブジェクトの名前を使う
+	if #selected == 1 then
+		output.Name = selected[1].Name .. "_VoxelizedBuilding"
+	else
+		-- 複数選択時
+		output.Name = "Multiple_VoxelizedBuilding"
+	end
+
+	output.Parent = workspace
+end
+--------------------------------------------------------------------
+-- カウンタ
+--------------------------------------------------------------------
+
+local createdCount = 0
+local splitSourceCount = 0
+local copiedCount = 0
+local meshCount = 0
+
+local skippedPropCount = 0
+local skippedSeatCount = 0
+local skippedNameCount = 0
+local skippedInteriorCount = 0
+
+local skippedProps = {}
+
+--------------------------------------------------------------------
+-- 重複処理防止
+--
+-- 親Modelと子Modelを両方選択してしまった場合など
+--------------------------------------------------------------------
+
+local processedParts = {}
+
+--------------------------------------------------------------------
+-- コピー
+--------------------------------------------------------------------
+
+local function copyPart(source)
+	local copy = source:Clone()
+
+	copy.Anchored = true
+	copy.Parent = output
+
+	createdCount += 1
+	copiedCount += 1
+
+	if source:IsA("MeshPart") then
+		meshCount += 1
+	end
+end
+
+--------------------------------------------------------------------
+-- 分割対象か
+--------------------------------------------------------------------
+
+local function shouldSplit(source)
+	-- MeshPartは直方体にすると見た目が壊れるため分割しない
+	if source:IsA("MeshPart") then
+		return false
+	end
+
+	local size = source.Size
+
+	return size.X >= MIN_SPLIT_SIZE
+		or size.Y >= MIN_SPLIT_SIZE
+		or size.Z >= MIN_SPLIT_SIZE
+end
+
+--------------------------------------------------------------------
+-- 最大個数に近くなる分割数
+--------------------------------------------------------------------
+
+local function calculateDivisions(size)
+	local divX = 1
+	local divY = 1
+	local divZ = 1
+
+	while true do
+		local currentTotal =
+			divX * divY * divZ
+
+		if currentTotal >= MAX_BLOCKS_PER_PART then
+			break
+		end
+
+		local cellX =
+			size.X / divX
+
+		local cellY =
+			size.Y / divY
+
+		local cellZ =
+			size.Z / divZ
+
+		local axis
+
+		if cellX >= cellY
+			and cellX >= cellZ then
+
+			axis = "X"
+
+		elseif cellY >= cellX
+			and cellY >= cellZ then
+
+			axis = "Y"
+
+		else
+			axis = "Z"
+		end
+
+		local nextX = divX
+		local nextY = divY
+		local nextZ = divZ
+
+		if axis == "X" then
+			nextX += 1
+
+		elseif axis == "Y" then
+			nextY += 1
+
+		else
+			nextZ += 1
+		end
+
+		local nextTotal =
+			nextX * nextY * nextZ
+
+		if nextTotal > MAX_BLOCKS_PER_PART then
+			break
+		end
+
+		divX = nextX
+		divY = nextY
+		divZ = nextZ
+	end
+
+	return divX, divY, divZ
+end
+
+--------------------------------------------------------------------
+-- Part分割
+--------------------------------------------------------------------
+
+local function splitPart(source)
+	local size = source.Size
+
+	local countX, countY, countZ =
+		calculateDivisions(size)
+
+	local cellX =
+		size.X / countX
+
+	local cellY =
+		size.Y / countY
+
+	local cellZ =
+		size.Z / countZ
+
+	for x = 1, countX do
+		for y = 1, countY do
+			for z = 1, countZ do
+
+				local localX =
+					-size.X / 2
+					+ cellX / 2
+					+ (x - 1) * cellX
+
+				local localY =
+					-size.Y / 2
+					+ cellY / 2
+					+ (y - 1) * cellY
+
+				local localZ =
+					-size.Z / 2
+					+ cellZ / 2
+					+ (z - 1) * cellZ
+
+				local block =
+					Instance.new("Part")
+
+				block.Name =
+					source.Name .. "_Block"
+
+				block.Size =
+					Vector3.new(
+						cellX,
+						cellY,
+						cellZ
+					)
+
+				block.CFrame =
+					source.CFrame
+					* CFrame.new(
+						localX,
+						localY,
+						localZ
+					)
+
+				----------------------------------------------------
+				-- 見た目
+				----------------------------------------------------
+
+				block.Color =
+					source.Color
+
+				block.Material =
+					source.Material
+
+				block.MaterialVariant =
+					source.MaterialVariant
+
+				block.Transparency =
+					source.Transparency
+
+				block.Reflectance =
+					source.Reflectance
+
+				----------------------------------------------------
+				-- 物理
+				----------------------------------------------------
+
+				block.Anchored = true
+				block.CanCollide = source.CanCollide
+				block.CanQuery = source.CanQuery
+				block.CanTouch = source.CanTouch
+				block.CastShadow = source.CastShadow
+
+				block.TopSurface =
+					Enum.SurfaceType.Smooth
+
+				block.BottomSurface =
+					Enum.SurfaceType.Smooth
+
+				block.Parent = output
+
+				createdCount += 1
+			end
+		end
+	end
+
+	splitSourceCount += 1
+
+	print(
+		("%s : %.1f × %.1f × %.1f → %d × %d × %d = %d個")
+			:format(
+				source.Name,
+				size.X,
+				size.Y,
+				size.Z,
+				countX,
+				countY,
+				countZ,
+				countX * countY * countZ
+			)
+	)
+end
+
+--------------------------------------------------------------------
+-- 1Part処理
+--------------------------------------------------------------------
+
+local function processPart(
+	source,
+	root,
+	boundsCFrame,
+	boundsSize
+)
+
+	if processedParts[source] then
+		return
+	end
+
+	processedParts[source] = true
+
+	----------------------------------------------------------------
+	-- 家具判定
+	----------------------------------------------------------------
+
+	local removeAsProp, reason =
+		shouldRemoveAsProp(
+			source,
+			root,
+			boundsCFrame,
+			boundsSize
+		)
+
+	if removeAsProp then
+		table.insert(
+			skippedProps,
+			source
+		)
+
+		skippedPropCount += 1
+
+		if reason == "seat_class" then
+			skippedSeatCount += 1
+
+		elseif reason == "prop_name" then
+			skippedNameCount += 1
+
+		elseif reason == "small_interior" then
+			skippedInteriorCount += 1
+		end
+
+		return
+	end
+
+	----------------------------------------------------------------
+	-- Preview時は生成しない
+	----------------------------------------------------------------
+
+	if PREVIEW_ONLY then
+		return
+	end
+
+	----------------------------------------------------------------
+	-- ボクセル化
+	----------------------------------------------------------------
+
+	if shouldSplit(source) then
+		splitPart(source)
+	else
+		copyPart(source)
+	end
+end
+
+--------------------------------------------------------------------
+-- 選択オブジェクト処理
+--------------------------------------------------------------------
+
+local function processObject(obj)
+	local parts =
+		getParts(obj)
+
+	if #parts == 0 then
+		return
+	end
+
+	local boundsCFrame, boundsSize =
+		getBounds(
+			obj,
+			parts
+		)
+
+	if not boundsCFrame then
+		return
+	end
+
+	print(
+		(
+			"処理対象: %s | BoundingBox %.1f × %.1f × %.1f"
+		):format(
+			obj.Name,
+			boundsSize.X,
+			boundsSize.Y,
+			boundsSize.Z
+		)
+	)
+
+	for _, part in ipairs(parts) do
+		processPart(
+			part,
+			obj,
+			boundsCFrame,
+			boundsSize
+		)
+	end
+end
+
+--------------------------------------------------------------------
+-- 実行
+--------------------------------------------------------------------
+
+for _, obj in ipairs(selected) do
+	processObject(obj)
+end
+
+--------------------------------------------------------------------
+-- Preview
+--------------------------------------------------------------------
+
+if PREVIEW_ONLY then
+	print("--------------------------------------------------")
+
+	print(
+		("家具候補: %d 個")
+			:format(skippedPropCount)
+	)
+
+	print(
+		("Seat系: %d | 名前判定: %d | 内部小物判定: %d")
+			:format(
+				skippedSeatCount,
+				skippedNameCount,
+				skippedInteriorCount
+			)
+	)
+
+	print("家具候補をSelectionに設定しました")
+
+	print("問題なければ PREVIEW_ONLY = false に変更して再実行してください")
+
+	print("--------------------------------------------------")
+
+	if #skippedProps > 0 then
+		Selection:Set(skippedProps)
+	else
+		warn("家具候補は見つかりませんでした")
+	end
+
+	return
+end
+
+--------------------------------------------------------------------
+-- 空なら出力Model削除
+--------------------------------------------------------------------
+
+if not output
+	or #output:GetChildren() == 0 then
+
+	if output then
+		output:Destroy()
+	end
+
+	warn("ボクセル化するPartがありませんでした")
+	return
+end
+
+--------------------------------------------------------------------
+-- 元モデル削除
+--------------------------------------------------------------------
+
+if not KEEP_ORIGINAL then
+	for _, obj in ipairs(selected) do
+		obj:Destroy()
+	end
+end
+
+--------------------------------------------------------------------
+-- 結果
+--------------------------------------------------------------------
+
+print("--------------------------------------------------")
+
+print(
+	(
+		"変換完了 | 生成Part数: %d | 分割した元Part: %d | そのままコピー: %d | MeshPart: %d"
+	):format(
+		createdCount,
+		splitSourceCount,
+		copiedCount,
+		meshCount
+	)
+)
+
+print(
+	("家具として除外: %d")
+		:format(skippedPropCount)
+)
+
+print(
+	("Seat系: %d | 名前判定: %d | 内部小物判定: %d")
+		:format(
+			skippedSeatCount,
+			skippedNameCount,
+			skippedInteriorCount
+		)
+)
+
+print(
+	("外周保護距離: %.1f Stud")
+		:format(SHELL_MARGIN)
+)
+
+print(
+	("1つの元Partあたり最大分割数: %d")
+		:format(MAX_BLOCKS_PER_PART)
+)
+
+print("--------------------------------------------------")
+
+--------------------------------------------------------------------
+-- 除外した家具を最後に選択
+--
+-- 生成後でも、何を家具と判断したか確認できる。
+--------------------------------------------------------------------
+
+if #skippedProps > 0 then
+	Selection:Set(skippedProps)
+
+	print(
+		"除外した家具候補をSelectionで選択しました"
+	)
+else
+	Selection:Set({ output })
+end

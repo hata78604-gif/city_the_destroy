@@ -12,6 +12,11 @@
 `npc_panic_spec.md`・`npc_bubble_fix.md`・`building_templates_spec.md` はすべて過去の**変更指示書**であり、
 実装済みの内容は本書が上書きする(食い違いがあれば本書が正)。
 
+作業開始前に必ず list_roblox_studios を実行し、
+対象が「(プロジェクト名)」であることを確認してから
+set_active_studio で明示的に指定すること。
+途中で別のツールを挟んだ後も、再度確認すること。
+
 ---
 
 ## 1. モジュール構成と責務
@@ -1523,3 +1528,79 @@ Studioで数値`BaseY`を設定済みなら手動値を優先し、未設定時�
 フォールバックする(§20-3)。これにより、D-1(手作りテンプレートのグリッドモード有効化)を
 実装する際は`placeTemplateBuilding`に`BaseY`属性を1行追加するだけで済む設計にしてある
 (§7の申し送り参照)。
+
+## 21. Phase 3-2: ★3 Tank
+
+- `ServerStorage.EnemyModels.Tank`はToolboxアセット`15081095657`を使用する。テンプレートは217 BasePartで、
+  `PrimaryPart`未設定のため実行時に最初のBasePartをcoreへフォールバックする。元モデル内のScript等は
+  Clone直後・WorkspaceへParentする前にすべて削除する。
+- `Body="model"` / `ModelTemplate="Tank"`を汎用Model経路として追加。全BasePartを
+  `Anchored=true` / `CanCollide=false` / `CanTouch=false` / `CanQuery=true`に統一し、`PivotTo`で移動する。
+  実機で砲身と移動方向を比較し、`ModelYawOffset=-90`を採用した。
+- Tankは3発耐久、道路速度14、プレイヤー砲撃は射程80・1秒予告・着弾半径10・命中時-3秒。
+  砲撃開始時の着弾位置を固定し、プレイヤーが予告中に半径外へ出れば回避できる。
+- 建物砲撃は4秒間隔・半径90内を最大50パーツ探索し、最寄りの`Destructible`かつ`BuildingId`付き
+  BasePartへ半径10の`DestructionManager.Explode`を行う。`attacker=nil`のためブロック点は入らない。
+- Tankの建物爆発が90%全壊ラインを越えた場合は`bonusPolicy="contribution"`を使う。建物総ブロック数に
+  対する最多プレイヤー貢献数が50%以上なら500点/+10秒、未満ならボーナスなしで
+  `軍隊に破壊された`を全員へ通知する。`bonusGiven`はどちらも1回で確定する。
+- Tankの爆風判定は、モデル全体の初期BoundingBoxを覆う透明な`DamageHitbox`で行う。Hitboxは
+  `Anchored=true` / `CanCollide=false` / `CanTouch=false` / `CanQuery=false`で、移動はModelの`PivotTo`に追従する。
+  爆心から直方体までの最短距離で判定するため、砲身・履帯を含む見た目の外周でも安定して被弾する。
+- ★3はThreshold=10000、Tank×2のみ。Tankを1台撃破するごとに、その個体だけを30秒後に同じsquadIdへ1台補充する。
+  全滅を待つ再派遣や、2台まとめての復活は行わない。★2の兵士・スナイパーや定期増援は含めない。
+- ★2のSoldier / Sniperは`RetainUntilStage=4`により★3中も撤退せず、同じ★2 squadIdへ
+  `ReinforcementUntilStage=4`まで20秒ごとの定期増援を続ける。★4へ昇格した時点で撤退・増援停止する。
+- Tank撃破は全BasePartを0.65秒で同時フェードする。R15死体・パトカーの既存物理処理は変更しない。
+- `Damage.Invincible=0`を維持し、`Damage.MaxLossPerMinute=30`を有効化した。
+
+## 22. Phase 3-2a: ラウンド開始位置・敵接地・ヘリ投下ライン
+
+### 22-1. 新ラウンドのCharacter再生成
+
+`GameManager`は各LOBBYのクリーンアップ後、`MapRuntime.LoadRound()`と各ManagerへのMapContext接続を
+完了してから、現在参加中の全Playerへ標準の`player:LoadCharacter()`を実行する。旧MAP破棄前には
+再生成せず、新しい固定MAPの`SpawnLocation`が存在する状態で行う。
+
+再生成時は既存の`CharacterAdded`経路を再利用する。LOBBY中の`CharacterAdded`では武器を配布せず、
+BATTLE開始時の`GiveToolsToAll()`だけが配布する。`WeaponServer.GiveTools()`は`WeaponKey`でBackpackと
+Characterを横断して重複を除外するため、再生成後もBazooka / Airstrike / RemoteBombは各1個だけとなる。
+
+### 22-2. 停止中の個体別接地Y
+
+敵stateへ`standingY`を持たせ、停止中はXZを変えず個体ごとの正しいcore Yだけを維持する。
+
+- PoliceOfficer: EnemySpawnへ接地した個体Y
+- Soldier: ヘリ降下完了時の着地Y
+- Sniper: 個別`SniperSpawn`へ接地した屋上Y。共通の地上Yへ戻さない
+- PoliceCar / Tank: `groundOffsetY`を反映して道路を走行し、目的地へ到着した瞬間の個体Yを
+  `roadStandingY`として保存する。車種共通の固定Yは使わない
+
+PoliceOfficer / SoldierはEnemySpawn markerのYを地面として扱わない。`currentMap`だけを対象にした
+下向きRaycastで直下表面を取得し、R15の`LeftFoot` / `RightFoot`の実際の底面をそこへ合わせる。
+直進移動中も毎フレーム同じRaycastを行い、表面の段差へ追従する。Raycastが外れた場合だけ従来の生成時Yを使う。
+
+移動速度、RoadNode経路、LaneOffset、Retarget、Waypoint判定、TurnDuration、Tankの
+`ModelYawOffset=-90`、既存の重力安定化は変更しない。
+
+### 22-3. HelicopterのSoldier投下ライン
+
+`Config.Threat.HelicopterTransport.DropInterval=1.0`、`DropRunSpeed=30`とする。ヘリはdropPointへ
+到着した時点でSniperを従来どおり1回だけ配置し、その後exit方向へ30 studs/sで前進しながら、
+現在のヘリXZを基準としてSoldierを1秒ごとに1人投下する。4人の中心間隔は約30 studs、先頭から
+最後までは約90 studsとなる。投下開始Yは毎回`currentHelicopterY - DropOffsetY`、地上の散らしは
+既存`LandingSpread`を使う。4人目の後はその時点の位置から既存`ExitSpeed`でexitへ離脱する。
+
+`pendingDeployments`は従来どおり、最初のyield前にSoldierとSniperの合計を一括加算し、個体の
+生成成功・失敗ごとに必ず1減らす。Heartbeat待機から戻るたびに`roundToken`、`aggressive`、
+`retiredSquads`、`transport.cancelled`、Modelの生存を再確認する。これにより★2→★3昇格や
+BATTLE終了が投下途中に起きても、残りSoldierを遅延生成せずヘリを破棄する。
+
+### 22-4. Studio確認結果
+
+- RESULTでCharacterを座標`(5000, 500, 5000)`へ移動して「次へ」を送信後、新Characterが固定MAPの
+  SpawnLocation付近へ生成され、旧Characterの検証属性が残らず、武器3種が各1個であることを確認
+- PoliceOfficer / Soldier / Sniper / PoliceCar / Tankは、停止または着地安定後6〜8秒間のY/XZ変化が0
+- Soldier 4人の生成間隔は`1.00 / 1.00 / 1.03秒`、XZ間隔は`27.7 / 31.9 / 34.2 studs`
+- ★2の1人目投下直後に★3へ上げ、6秒後も旧Soldierは1人、旧ヘリ0、Tank 2台であることを確認
+- BATTLE終了相当の`SetAggressive(false)`でも、1人目投下後6秒間Soldierは1人のまま、ヘリ0

@@ -49,9 +49,9 @@ DestructionManager.Init({
 	addScore = WeaponServer.AddScore,
 	addTime = RoundClock.Add, -- 全壊時のタイム報酬用(Step1で追加)
 	-- 爆風の影響を受けるモジュール群。Explode終了時に全員へctxがそのまま渡る。
-	-- hudRemoteの配線はStep6(戦車にボーナスを奪われた際の通知)で追加する
 	blastListeners = { NPCManager.OnExplosion, EnemyManager.OnExplosion }, -- ★Step2で1要素追加
 	effectRemote = remotes.Effect,
+	hudRemote = remotes.Hud,
 })
 NPCManager.Init({
 	addScore = WeaponServer.AddScore,
@@ -75,9 +75,12 @@ EnemyManager.Init({
 	addScore = WeaponServer.AddScore,
 	addTime = RoundClock.Add,
 	getRemaining = RoundClock.Remaining,
-	roadLines = nil, -- 固定MAP Phase 1では敵・道路未対応。将来SetMapContext(context)へ置換する
 	effectRemote = remotes.Effect,
 	hudRemote = remotes.Hud,
+	explode = DestructionManager.Explode,
+	onEnemyKilled = function(squadId, typeName)
+		ThreatManager.OnEnemyKilled(squadId, typeName)
+	end,
 })
 ThreatManager.Init({
 	getScore = WeaponServer.GetTotalScore,
@@ -164,6 +167,22 @@ local function waitForReady()
 	conn:Disconnect()
 end
 
+-- 新しい固定MAPとSpawnLocationが揃ってから、前ラウンドのCharacter状態を標準Respawnで破棄する。
+-- CharacterAddedの既存処理を再利用し、LOBBY中なので武器はここでは配布されない。
+local function respawnPlayersForRound()
+	for _, player in Players:GetPlayers() do
+		if player.Parent == Players then
+			local ok, err = pcall(function()
+				player:LoadCharacter()
+			end)
+			if not ok then
+				warn(("[GameManager] %s のラウンド開始Respawnに失敗しました: %s")
+					:format(player.Name, tostring(err)))
+			end
+		end
+	end
+end
+
 task.wait(3) -- 起動直後のロード猶予
 
 while true do
@@ -178,8 +197,10 @@ while true do
 	DestructionManager.ClearAllRubble()
 	local mapContext = MapRuntime.LoadRound()
 	local buildings = mapContext.buildings
-	-- Phase 2以降、敵対応時はここでEnemyManager.SetMapContext(mapContext)を呼べる構造にする。
+	EnemyManager.SetMapContext(mapContext) -- 毎ラウンドCloneされた新しいMapContextを設定する
+	NPCManager.SetMapContext(mapContext) -- NPCSpawnの座標コピーだけを保持し、旧Map Instanceは保持しない
 	DestructionManager.SetBuildings(buildings)
+	respawnPlayersForRound() -- 新MAPのSpawnLocationを使って前ラウンドのCharacter状態をリセット
 	runPhase("LOBBY", Config.Round.LobbyTime)
 
 	-- 2) バトル: 武器配布 + NPC出現

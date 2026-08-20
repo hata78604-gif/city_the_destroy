@@ -1,0 +1,47 @@
+STEP3-v10 Surface Detail Phase 3 Report
+Status: PASS
+Scope: phase 3 scale bump plus limited head/chest/tail Scale_Plate samples; phases 4-6 pending
+Blender: 5.2.0 LTS
+Reference image: kaiju_model.png (SHA256 5886f8122d2b1f12e98f80d86116193bb49e25168755571c65cb04b809989398)
+Baseline: Kaiju_Blockout_v09.blend
+Baseline SHA256: 7c0e285b052efc93fd22379e98aac07781947e97d2392078e7accf1892512b66
+Output: Kaiju_Blockout_v10_SurfaceDetail.blend
+Object count: 168 (108 baseline + 60 scale samples)
+Project collection: KAJU_PROJECT_V10
+Collection hierarchy:
+  KAJU_PROJECT_V10/SURFACE_DETAIL/SCALES
+  KAJU_PROJECT_V10/SURFACE_DETAIL/WRINKLES
+  KAJU_PROJECT_V10/SURFACE_DETAIL/LAVA_CRACKS
+Surface detail scale object count: 60 (Phase 3 limited sample)
+Scale distribution: Head 14, Chest/Torso 30, Tail 16
+Scale_Plate geometry: one shared irregular six-sided mesh, shallow 0.008-0.034 m surface offset
+Materials created/available:
+  M_Body_Rock_Procedural (applied to former M_Body_Dark slots)
+  M_Scale_Obsidian
+  M_Wrinkle_Dark
+  M_Lava_Crack
+  M_Tooth_Ivory (preserved)
+  M_Eye_Red (preserved)
+Rock material node count: 12 (includes fine scale-cell Voronoi bump)
+Body material slots changed: 44
+Abdomen darkening slots changed: 1 (M_Belly_DarkGray -> M_Body_Rock_Procedural)
+Rock bump strength: 0.18 (guide range 0.12-0.22), PASS
+Bounds min: (-2.7321, -3.8200, 0.0000)
+Bounds max: (2.7321, 8.0025, 10.0000)
+Dimensions XYZ: (5.4642, 11.8225, 10.0000) m
+Bounds delta from v09 XYZ: +0.0000%, +0.0000%, +0.0000%
+Required object preservation: PASS
+Object transform preservation: PASS
+Camera/light preservation: PASS
+v09 comparison renders:
+  Kaiju_Blockout_v09_Front.png: PRESENT, SHA256 0a5fde1e51b81bce1446cacd8a854a986d3372be735f2e033615fb29aeaa6478
+  Kaiju_Blockout_v09_Right.png: PRESENT, SHA256 b042ec4909bbddd3e49bbe926693e72ec77e97bc587f35d84927e7521060b69d
+  Kaiju_Blockout_v09_Back.png: PRESENT, SHA256 054f0a338daafa5691d997ccfc067c49c8d6066596426f23afae1ea893b8a642
+  Kaiju_Blockout_v09_Perspective.png: PRESENT, SHA256 1fafd447af3797ee3de6343f4998463a5bed48a837a4ed456afbdae74417e1f6
+Phase 3 preview renders:
+  Kaiju_Blockout_v10_SurfaceDetail_Front.png: PRESENT, SHA256 1f7b8a185cfe89869aaa035d7fe632b2a6708b520c92bdbb08cd08e0db38c9e8
+  Kaiju_Blockout_v10_SurfaceDetail_Right.png: PRESENT, SHA256 0bba31d4c39055810e53d0bdb8f72a08e341afb9776af71dfbc4ab77e8929d42
+  Kaiju_Blockout_v10_SurfaceDetail_Back.png: PRESENT, SHA256 a92092444ad980380ff9dace0186e521500f78f22e8cedff4186a30b181ce479
+  Kaiju_Blockout_v10_SurfaceDetail_Perspective.png: PRESENT, SHA256 c87363e5c78e9a0ab62a47b6ee1188bccb45b880964c1f0debdf70f39c01a671
+Wrinkles/lava cracks: NOT STARTED (later phases)
+Validation: PASS

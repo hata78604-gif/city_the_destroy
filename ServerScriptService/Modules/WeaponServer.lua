@@ -37,6 +37,7 @@ local Destruction = nil -- DestructionManager
 local toolFolder = nil -- ツールのテンプレート置き場
 local projectileFolder = nil -- 弾・爆弾の置き場
 local roundActive = false -- バトル中だけ発射を受け付ける
+local roundToken = 0 -- SetRoundActive(false)のたびに+1。前ラウンドの遅延攻撃を無効化する
 
 -- プレイヤーごとの状態: { cooldownUntil = {武器名=時刻}, bombs = {設置爆弾}, scoreValue = IntValue }
 local playerData = {}
@@ -203,6 +204,7 @@ local function fireBazooka(player, data, root, targetPos)
 	ball.Parent = projectileFolder
 
 	remotes.Effect:FireAllClients("shot", { position = origin })
+	local token = roundToken
 
 	-- サーバー側で弾を進める(毎フレーム、進む分だけレイキャストして衝突判定)
 	task.spawn(function()
@@ -214,6 +216,12 @@ local function fireBazooka(player, data, root, targetPos)
 		local travelled = 0
 		while travelled < wc.MaxDistance do
 			local dt = RunService.Heartbeat:Wait()
+			if not roundActive or roundToken ~= token or not ball.Parent then
+				if ball.Parent then
+					ball:Destroy()
+				end
+				return
+			end
 			local step = wc.Speed * dt
 			local result = workspace:Raycast(pos, dir * step, rayParams)
 			if result then
@@ -227,6 +235,9 @@ local function fireBazooka(player, data, root, targetPos)
 			end
 		end
 		ball:Destroy()
+		if not roundActive or roundToken ~= token then
+			return
+		end
 		Destruction.Explode({ position = pos, radius = wc.Radius, attacker = player, source = "Bazooka" })
 	end)
 end
@@ -236,7 +247,10 @@ end
 -- マーカー(矩形)表示 → Delay秒後に編隊が爆撃線の上を通過しながら順次投下
 --------------------------------------------------------------------
 -- 爆弾1発。投下地点の真上から落下して着弾で爆発する
-local function dropBomb(player, ground, wc, withWhistle)
+local function dropBomb(player, ground, wc, withWhistle, token)
+	if not roundActive or roundToken ~= token then
+		return
+	end
 	local start = ground + Vector3.new(0, wc.DropHeight, 0)
 
 	local bomb = Instance.new("Part")
@@ -262,6 +276,9 @@ local function dropBomb(player, ground, wc, withWhistle)
 		{ CFrame = CFrame.new(ground) })
 	tween.Completed:Once(function()
 		bomb:Destroy()
+		if not roundActive or roundToken ~= token then
+			return
+		end
 		Destruction.Explode({
 			position = ground,
 			radius = wc.Radius,
@@ -364,6 +381,7 @@ local function fireAirstrike(player, data, root, targetPos)
 	})
 
 	local schedule = buildSchedule(wc)
+	local token = roundToken
 
 	-- 戦闘機の速度は投下スケジュールから導出する(入力値として持たない)。
 	-- 「先頭弾の投下時刻に線の始点上空」「最終弾の投下時刻に線の終点上空」を通過させることで、
@@ -380,6 +398,9 @@ local function fireAirstrike(player, data, root, targetPos)
 	end
 
 	task.delay(wc.Delay, function()
+		if not roundActive or roundToken ~= token then
+			return
+		end
 		-- 編隊の飛行。線の始点手前PlaneLeadから終点先PlaneLeadまでを同じ速度で飛ぶ
 		local half = wc.LineLength / 2
 		local right = Vector3.new(-dir.Z, 0, dir.X) -- dirをXZ平面で90°回した単位ベクトル
@@ -399,6 +420,7 @@ local function fireAirstrike(player, data, root, targetPos)
 			-- CFrameValueをTweenしてPivotToでモデルごと動かす(EnemyManagerと同じ手法)
 			local driver = Instance.new("CFrameValue")
 			driver.Value = CFrame.lookAt(from, from + dir)
+			driver.Parent = plane -- ラウンド境界でplaneと一緒に破棄し、Tweenも停止できるようにする
 			driver.Changed:Connect(function(cf)
 				if plane.Parent then
 					plane:PivotTo(cf)
@@ -425,7 +447,7 @@ local function fireAirstrike(player, data, root, targetPos)
 		for i, entry in schedule do
 			local along = -half + planeSpeed * entry.at
 			local ground = center + right * planeLateral(entry.plane, wc) + dir * along
-			task.delay(leadTime + entry.at, dropBomb, player, ground, wc, i == 1)
+			task.delay(leadTime + entry.at, dropBomb, player, ground, wc, i == 1, token)
 		end
 	end)
 end
@@ -674,12 +696,18 @@ end
 function WeaponServer.SetRoundActive(active)
 	roundActive = active
 	if not active then
+		roundToken += 1
 		for player, data in playerData do
 			for _, bomb in data.bombs do
 				bomb:Destroy()
 			end
 			data.bombs = {}
 			remotes.BombCount:FireClient(player, 0)
+		end
+		-- バズーカ弾・落下爆弾・戦闘機を一括削除する。
+		-- 対応するtask/TweenはroundTokenも確認するため、次ラウンドでは爆発しない。
+		if projectileFolder then
+			projectileFolder:ClearAllChildren()
 		end
 	end
 end

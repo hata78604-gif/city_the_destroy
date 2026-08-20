@@ -1,0 +1,16 @@
+STEP3 Kaiju Blockout generation report
+Status: PASS
+Blender: 5.2.0 LTS
+Forward axis: -Y
+Unit system: Metric / Meters / scale 1.0
+World bounds min: (-2.69, -3.42, 0.00)
+World bounds max: (2.69, 7.43, 10.00)
+Dimensions XYZ: (5.38, 10.85, 10.00) m
+Target height: 10.00 m
+Head length config: 2.20 m
+Shoulder width config: 3.40 m
+Tail length config: 6.80 m
+Forward lean: 28.0 degrees
+Dorsal plates: 7
+Blockout objects: 50
+Required object check: PASS

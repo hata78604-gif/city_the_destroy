@@ -1,0 +1,17 @@
+STEP3-v08 Elbow Revision Report
+Status: PASS
+Scope: elbows/arms only; v07 face and v06 legs unchanged
+Builder: independent v08 arm replacement
+Blender: 5.2.0 LTS
+Forward axis: -Y
+Bounds min: (-2.73, -3.34, 0.00)
+Bounds max: (2.73, 8.00, 10.00)
+Dimensions XYZ: (5.46, 11.34, 10.00) m
+Arm chain (left; right is mirrored):
+  Shoulder: X=1.72, Y=-0.87, Z=7.80
+  Elbow:    X=1.98, Y=-0.97, Z=6.50
+  Wrist:    X=1.88, Y=-1.73, Z=5.60
+  Hand:     X=1.88, Y=-1.87, Z=5.50
+Elbow bend: PASS (upper arm and forearm use distinct directions)
+Validation: PASS
+Deferred: Tail_Spine objects; further head and leg changes

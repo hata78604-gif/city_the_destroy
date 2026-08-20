@@ -21,10 +21,8 @@ local stage = 0
 local squadSeq = 0
 local currentSquadId = nil
 local waitingRespawn = false
--- 定期増援(全滅を待たない再派遣)の次回派遣時刻。ReinforcementIntervalを持つ段階でのみ使う値で、
--- 持たない段階(★1)ではnil。promote()で段階が変わるたびに必ず上書きされるため、
--- ★3以降へ昇格した瞬間に★2用の値は自動的に無効化される
-local nextReinforcementAt = nil
+-- squadごとの定期増援予約。★2のように後の段階まで残る部隊も、元のsquadIdへ増援し続ける。
+local reinforcementSchedules = {}
 local roundToken = 0 -- Clear()のたびに+1。task.delay(RespawnDelay待機)の世代確認に使う
 -- 再派遣予約(RespawnDelay待機)だけを無効化する世代トークン(Step5-0)。roundTokenと役割が違う:
 -- roundTokenはラウンドをまたぐ非同期処理を無効化し、respawnTokenは同じラウンド内で
@@ -44,11 +42,26 @@ local function cancelPendingRespawn()
 	waitingRespawn = false
 end
 
+local function startReinforcementSchedule(squadId, def)
+	if not def.ReinforcementInterval then
+		return
+	end
+	reinforcementSchedules[squadId] = {
+		squadId = squadId,
+		squad = def.Squad,
+		interval = def.ReinforcementInterval,
+		-- 未指定の段階は従来どおり、次の段階へ進んだ時点で増援を止める。
+		untilStage = def.ReinforcementUntilStage or (stage + 1),
+		nextAt = os.clock() + def.ReinforcementInterval,
+	}
+end
+
 --------------------------------------------------------------------
 -- 昇格
 --------------------------------------------------------------------
 local function promote(n)
 	local previousSquadId = currentSquadId -- 上書き前に保存(Step5-0: 撤退させる対象)
+	local previousDef = Config.Threat.Stages[stage]
 	cancelPendingRespawn() -- 旧段階の再派遣予約(あれば)を無効化
 
 	local def = Config.Threat.Stages[n]
@@ -69,10 +82,16 @@ local function promote(n)
 			:format(def.Name, os.clock() - roundStartClock, deps.getScore()))
 	end
 
-	-- ★0からの初回昇格はpreviousSquadId==nilなので撤退処理を呼ばない。
-	-- Retreat.Enabled=falseのときは呼ばず、旧部隊を残したまま新部隊を派遣する(切り分け用)
+	-- RetainUntilStageを持つ旧部隊は、その段階に到達するまで残す。
+	-- ★2は★3中も残り、★4昇格で初めて撤退する。
 	if previousSquadId then
-		if Config.Threat.Retreat.Enabled then
+		local retainPrevious = previousDef and previousDef.RetainUntilStage and n < previousDef.RetainUntilStage
+		if retainPrevious then
+			if Config.Threat.DebugLog then
+				print(("[ThreatManager] squad=%d を★%dまで維持します")
+					:format(previousSquadId, previousDef.RetainUntilStage))
+			end
+		elseif Config.Threat.Retreat.Enabled then
 			deps.enemies.RetreatSquad(previousSquadId)
 		elseif Config.Threat.DebugLog then
 			print("[ThreatManager] Retreat.Enabled=false のため旧部隊を残します")
@@ -80,14 +99,7 @@ local function promote(n)
 	end
 
 	deps.enemies.DeploySquad(currentSquadId, def.Squad)
-
-	-- 定期増援タイマーの(再)設定。新段階がReinforcementIntervalを持たなければnilに戻す
-	-- (これにより★2→★3昇格のような場合、★2用の次回時刻が確実に無効化される)
-	if def.ReinforcementInterval then
-		nextReinforcementAt = os.clock() + def.ReinforcementInterval
-	else
-		nextReinforcementAt = nil
-	end
+	startReinforcementSchedule(currentSquadId, def)
 end
 
 --------------------------------------------------------------------
@@ -106,13 +118,19 @@ local function monitorLoop()
 			end
 
 			local def = stages[stage]
-			if def and def.ReinforcementInterval then
-				-- 定期増援方式: 生存数を見ず、一定間隔で同じsquadIdへSquad一式を追加派遣する。
-				-- waitingRespawn/squadSeqには触れない(全滅再派遣方式とは排他)
-				if currentSquadId and os.clock() >= nextReinforcementAt then
-					deps.enemies.DeploySquad(currentSquadId, def.Squad)
-					nextReinforcementAt = os.clock() + def.ReinforcementInterval
+			for squadId, schedule in reinforcementSchedules do
+				if schedule.untilStage and stage >= schedule.untilStage then
+					reinforcementSchedules[squadId] = nil
+				elseif os.clock() >= schedule.nextAt then
+					deps.enemies.DeploySquad(schedule.squadId, schedule.squad)
+					schedule.nextAt = os.clock() + schedule.interval
 				end
+			end
+
+			if def and def.ReinforcementInterval then
+				-- 定期増援は上のsquad別予約で処理済み。全滅再派遣方式とは排他。
+			elseif def and def.IndividualRespawnDelay then
+				-- 個体ごとの撃破時にOnEnemyKilled()が補充を予約する方式。全滅でまとめて再派遣しない。
 			elseif currentSquadId and not waitingRespawn
 				and deps.enemies.CountAlive(currentSquadId) == 0 then
 				-- 二重派遣防止ガード。CheckIntervalが1秒なので、これが無いと
@@ -145,6 +163,28 @@ local function monitorLoop()
 	end
 end
 
+-- IndividualRespawnDelayを持つ段階向け。撃破した1体だけを、撃破時点から指定秒数後に補充する。
+-- 予約ごとにstage/squad/round/runningを再確認するため、昇格・RESULT・次ラウンドへは持ち越さない。
+function ThreatManager.OnEnemyKilled(squadId, typeName)
+	local def = Config.Threat.Stages[stage]
+	local delay = def and def.IndividualRespawnDelay
+	if not delay or not running or currentSquadId ~= squadId then
+		return
+	end
+
+	local watchedStage = stage
+	local watchedRoundToken = roundToken
+	task.delay(delay, function()
+		if roundToken ~= watchedRoundToken
+			or not running
+			or stage ~= watchedStage
+			or currentSquadId ~= squadId then
+			return
+		end
+		deps.enemies.DeploySquad(squadId, { { type = typeName, count = 1 } })
+	end)
+end
+
 --------------------------------------------------------------------
 -- ラウンド制御
 --------------------------------------------------------------------
@@ -152,7 +192,7 @@ function ThreatManager.Start()
 	stage = 0
 	squadSeq = 0
 	currentSquadId = nil
-	nextReinforcementAt = nil
+	table.clear(reinforcementSchedules)
 	cancelPendingRespawn()
 	running = true
 	roundStartClock = os.clock()
@@ -171,7 +211,7 @@ end
 
 function ThreatManager.Stop()
 	running = false
-	nextReinforcementAt = nil
+	table.clear(reinforcementSchedules)
 	cancelPendingRespawn()
 	deps.enemies.SetAggressive(false)
 end
@@ -182,7 +222,7 @@ function ThreatManager.Clear()
 	stage = 0
 	squadSeq = 0
 	currentSquadId = nil
-	nextReinforcementAt = nil
+	table.clear(reinforcementSchedules)
 	cancelPendingRespawn()
 end
 

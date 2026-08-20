@@ -131,8 +131,8 @@ Config.Visual = {
 -- ▼ ラウンド進行(秒) ------------------------------------------------
 Config.Round = {
 	LobbyTime = 3, -- ロビー待機(この間にマップ生成)
-	BattleTime = 120, -- 破壊タイム(基礎値。RoundClockがこれを起点に増減する)
-	BattleTimeMax = 300, -- ハードキャップ(RoundClock.Addで加算してもこれ以上は増えない)
+	BattleTime = 300, -- 破壊タイム(基礎値。RoundClockがこれを起点に増減する)
+	BattleTimeMax = 9999, -- ハードキャップ(RoundClock.Addで加算してもこれ以上は増えない)
 	BattleTimeFloor = 15, -- 下限フロア(RoundClock.Addで減算してもこれ以下には下がらない)
 	-- ※未使用(2026-07-31〜)。リザルトが「次へ」ボタンによる手動進行になったため、
 	-- この秒数を使うカウントダウンは無くなった。他から参照されていないことを確認済みだが、
@@ -233,7 +233,7 @@ Config.Weapons = {
 	Bazooka = {
 		DisplayName = "バズーカ",
 		SlotKey = 1, -- キーボードの数字キー
-		Radius = 12, -- 爆発半径(stud)
+		Radius = 25, -- 爆発半径(stud)
 		Cooldown = 0.3, -- 連射間隔(秒)。AutoFireがtrueの間、この間隔で撃ち続けられる
 		AutoFire = true, -- 押しっぱなしで連射するか。Airstrike/RemoteBombには付けない(単発のまま)
 		Speed = 100, -- 弾速(stud/s) ゆっくりめで弾が見える
@@ -245,7 +245,7 @@ Config.Weapons = {
 	Airstrike = {
 		DisplayName = "エアストライク",
 		SlotKey = 2,
-		Radius = 12, -- 爆弾1発の爆発半径
+		Radius = 25, -- 爆弾1発の爆発半径
 		Cooldown = 20, -- 1ラウンド120秒なので約6回使える
 		Delay = 3, -- マーカー表示から第1弾の投下までの秒数
 		DropHeight = 80, -- 爆弾の落下開始高度(戦闘機の飛行高度でもある)
@@ -267,7 +267,7 @@ Config.Weapons = {
 	RemoteBomb = {
 		DisplayName = "リモート爆弾",
 		SlotKey = 3,
-		Radius = 15, -- 起爆時の爆発半径(大爆発)
+		Radius = 30, -- 起爆時の爆発半径(大爆発)
 		Cooldown = 1, -- 起爆後のクールダウン
 		MaxBombs = 10, -- 同時設置数の上限
 		-- 設置できる最大距離(プレイヤーからの水平距離。高さは見ない)。
@@ -352,11 +352,12 @@ Config.Score = {
 	-- (10→5。THREAT_DESIGN_PROPOSAL.md §5-10 優先順位1)
 	BuildingBonusTime = 10,
 	BonusThreshold = 0.9, -- 全壊とみなす破壊率(90%)
+	BonusMinShare = 0.5, -- 敵が全壊ラインを越えた場合に首位貢献者へボーナスを残す最低貢献率
 }
 
 -- ▼ 敵システム(★1〜) --------------------------------------------------
 Config.Threat = {
-	Enabled = false, -- 固定MAP Phase 1では道路・敵スポーン未対応のため無効
+	Enabled = true, -- 固定MAP MetadataをMapContext経由で利用する本番経路
 	ScoreSource = "sum", -- "sum"=全プレイヤーのスコア合計 / "top"=最高スコア
 	CheckInterval = 1, -- 段階判定を行う間隔(秒)
 	DebugLog = true, -- 段階到達時刻・湧き・撃破をサーバーログに出す(閾値チューニング用)
@@ -390,8 +391,8 @@ Config.Threat = {
 		RangeGrace = 1.1, -- 着弾時の距離再判定で AttackRange に掛ける猶予倍率
 
 		-- 直近60秒あたりの最大損失キャップ。0=無効。
-		-- ★1の動作検証は完了したため0(無効)に戻した(2026-07-31)。★3(戦車)で改めて採否を判断する
-		MaxLossPerMinute = 0,
+		-- ★3戦車の砲撃を追加したため、無敵時間は0のまま1分あたり30秒に制限する
+		MaxLossPerMinute = 30,
 
 		ComebackMultiplier = 1.5, -- 残り時間が少ないときの撃破報酬の倍率
 		ComebackThreshold = 25, -- 残りがこの秒数を下回ると ComebackMultiplier が効く
@@ -401,7 +402,7 @@ Config.Threat = {
 	Spawn = {
 		MinDistanceFromPlayer = 100, -- この距離以内には湧かせない
 		Interval = 0.4, -- 1体ずつ間を空けて湧かせる(生成負荷の平準化)
-		-- 固定MAPの湧き位置は将来MapRuntimeのMapContextから受け取る。
+		-- 固定MAPの湧き位置はMapRuntimeのMapContextから受け取る。
 		-- 交差点中心から警官を散らす最大距離(stud)。上げてよいのは「まだ重なって見える」場合のみ、
 		-- 8を上限とする(道路幅16の半分)。大きくしすぎるとバズーカ1発でまとめて倒せなくなる(手順6)
 		Jitter = 6,
@@ -414,7 +415,8 @@ Config.Threat = {
 		ExitSpeed = 90, -- 投下後は演出を長引かせず素早く離脱
 		EntryMargin = 80, -- 街外から飛来していることが視覚的に分かる距離
 
-		DropInterval = 0.18, -- 4人が完全同時ではなく、短い間隔で順番に降りる
+		DropInterval = 1.0, -- 投下走行中、約1秒ごとに1人ずつ降ろす
+		DropRunSpeed = 30, -- Soldier投下中の前進速度。初期値では約30stud間隔になる
 		DescendSpeed = 70, -- 高度75から約1秒前後で地面へ到達
 		DropOffsetY = 6, -- ヘリ本体の中央からではなく下部から降下して見えるようにする
 		LandingSpread = 6, -- 道路幅16の半分8より小さくし、道路外へ飛び出しにくくする
@@ -440,7 +442,8 @@ Config.Threat = {
 	EnemyTypes = {
 		PoliceOfficer = {
 			DisplayName = "警官",
-			Body = "human", -- 見た目の作り分け。今回は "human" のみ実装
+			Body = "rig",
+			RigTemplate = "PoliceOfficer",
 			BodyColors = {
 				Shirt = Color3.fromRGB(30, 50, 120),
 				Pants = Color3.fromRGB(25, 30, 45),
@@ -506,10 +509,46 @@ Config.Threat = {
 			-- 大きくないと曲がり角を回り続ける。MoveSpeedやTurnDurationを変えたらここも見直すこと
 			WaypointRadius = 10,
 		},
-		-- Tank は Step 6 で追加する。未実装の種別を Stages から参照するとエラーになるため、ここにも書かない
+		Tank = {
+			DisplayName = "戦車",
+			Body = "model",
+			ModelTemplate = "Tank",
+			ModelYawOffset = -90, -- PrimaryPartフォールバック後も砲身側が進行方向を向く補正値
+
+			Hits = 3,
+			HitCooldown = 0.4,
+			UseModelHitbox = true, -- 見た目全体を覆う透明Hitboxで爆風距離を判定する
+
+			Movement = "road",
+			MoveSpeed = 14,
+			ApproachSpeed = 14,
+			StopDistance = 15,
+
+			AttackType = "shell",
+			AttackRange = 80,
+			AttackInterval = 3,
+			Telegraph = 1,
+
+			TimePenalty = 3,
+			ScoreReward = 2500,
+			TimeReward = 15,
+
+			DestroysBuildings = true,
+			ShellRadius = 10,
+			ShellInterval = 4,
+			BuildingScanRadius = 90,
+			DeathMode = "fade",
+
+			LaneOffset = 4,
+			RetargetThreshold = 30,
+			RetargetInterval = 1,
+			TurnDuration = 0.25,
+			WaypointRadius = 10,
+		},
 		Soldier = {
 			DisplayName = "兵士",
-			Body = "human", -- PoliceOfficerと同じ人型の組み立て(buildHumanBody)を使う
+			Body = "rig",
+			RigTemplate = "Soldier",
 
 			BodyColors = {
 				Shirt = Color3.fromRGB(72, 82, 55),
@@ -540,7 +579,8 @@ Config.Threat = {
 		},
 		Sniper = {
 			DisplayName = "スナイパー",
-			Body = "human", -- 既存の軽量人型6パーツをそのまま流用する
+			Body = "rig",
+			RigTemplate = "Sniper",
 
 			BodyColors = {
 				Shirt = Color3.fromRGB(45, 48, 52), -- Soldier(オリーブ系)と区別できる暗いグレー系
@@ -568,7 +608,6 @@ Config.Threat = {
 	},
 
 	-- ▼ 段階(配列。順序が段階の順序。★4は末尾に1エントリ足すだけで動く設計)
-	-- ★3は未実装の敵種別(Tank)を参照するため、今回は書かない
 	Stages = {
 		{
 			Name = "★1 警察",
@@ -593,6 +632,9 @@ Config.Threat = {
 			-- 同じsquadIdへSquad一式(ヘリ1機・Soldier4・Sniper2)を無制限に追加する。
 			-- ReinforcementIntervalが無い段階(★1)は従来どおり全滅後RespawnDelayで再派遣される
 			ReinforcementInterval = 20,
+			-- ★3のTank出現中もこのsquadを残し、定期増援も継続する。★4昇格で初めて撤退・停止する。
+			RetainUntilStage = 4,
+			ReinforcementUntilStage = 4,
 			Squad = {
 				{
 					type = "Soldier",
@@ -604,6 +646,16 @@ Config.Threat = {
 						{ type = "Sniper", count = 2, placement = "rooftop" },
 					},
 				},
+			},
+		},
+		{
+			Name = "★3 戦車",
+			Threshold = 10000,
+			Telop = "戦車部隊が出動した!",
+			Sound = "Siren",
+			IndividualRespawnDelay = 30, -- Tankを1台撃破するたび、そのTankだけ30秒後に補充する
+			Squad = {
+				{ type = "Tank", count = 2 },
 			},
 		},
 	},

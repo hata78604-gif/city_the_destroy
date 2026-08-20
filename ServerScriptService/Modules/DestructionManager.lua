@@ -47,7 +47,7 @@ local RUBBLE_MAX_TOTAL = rubbleCfg.MaxTotal or 3000
 local DestructionManager = {}
 local rng = Random.new()
 
--- Init() で注入される依存: { addScore(player, points, category), addTime(delta, reason, player), blastListeners(配列: {fn(ctx), ...}), effectRemote }
+-- Init() で注入される依存: { addScore(player, points, category), addTime(delta, reason, player), blastListeners(配列: {fn(ctx), ...}), effectRemote, hudRemote }
 -- blastListeners は爆風の影響を受けるモジュール群(NPCManager等)。Explode終了時に全員へctxをそのまま渡す
 local deps = nil
 
@@ -129,6 +129,13 @@ end
 -- ブロック1個ぶんの共通処理(物理化の有無によらず必ず行う)
 -- スコア加算・建物破壊率の更新・90%以上での全壊ボーナス判定
 --------------------------------------------------------------------
+local function giveBuildingBonus(player)
+	deps.addScore(player, Config.Score.BuildingBonus, "buildingBonus")
+	if deps.addTime then
+		deps.addTime(Config.Score.BuildingBonusTime, "building", player)
+	end
+end
+
 local function registerDestruction(part, ctx)
 	-- ブロック加点: attackerがいるときだけ。scoreScaleは連鎖ボーナス用(Step0では常に1=無変化)
 	if ctx.attacker then
@@ -138,6 +145,13 @@ local function registerDestruction(part, ctx)
 	local buildingId = part:GetAttribute("BuildingId")
 	local building = buildingId and buildings[buildingId]
 	if building then
+		-- プレイヤーが壊したブロック数を建物ごとに遅延生成で記録する。
+		-- 戦車が全壊ラインを越えたときだけ参照し、通常の全壊ボーナス経路は変えない。
+		if ctx.attacker then
+			building.credit = building.credit or {}
+			building.credit[ctx.attacker] = (building.credit[ctx.attacker] or 0) + 1
+		end
+
 		-- destroyedはattackerの有無に関係なく必ず加算する(敵が壊した分も破壊率に含める。
 		-- 含めないと「敵に半分壊された建物はプレイヤーが残りを全部壊しても90%に届かない」
 		-- という理不尽なバグになる。THREAT_DESIGN_PROPOSAL.md §5-3付録(2)参照)
@@ -145,18 +159,22 @@ local function registerDestruction(part, ctx)
 		if not building.bonusGiven
 			and building.destroyed >= math.ceil(building.total * Config.Score.BonusThreshold) then
 			building.bonusGiven = true
-			-- 全壊ボーナスの帰属: bonusPolicy="normal"(既定)かつattackerがいる場合のみ加点する。
-			-- "deny"(Step6で戦車が使う予定)なら誰にも与えない。
-			-- 従来はattacker==nilのとき暗黙に加点されなかっただけだったが、意図を明示するため
-			-- bonusPolicyによる分岐に書き直した(THREAT_DESIGN_PROPOSAL.md §5-3付録(1)参照)
 			local policy = ctx.bonusPolicy or "normal"
 			if policy == "normal" and ctx.attacker then
-				deps.addScore(ctx.attacker, Config.Score.BuildingBonus, "buildingBonus")
-				-- タイム加算はスコア加算と同じ分岐の中に置く。別分岐にすると、将来
-				-- bonusPolicy="deny"を追加したときに「スコアは入らないが時間だけ増える」
-				-- というズレが生まれるため(THREAT_DESIGN_PROPOSAL.md §5-3参照)
-				if deps.addTime then
-					deps.addTime(Config.Score.BuildingBonusTime, "building", ctx.attacker)
+				giveBuildingBonus(ctx.attacker)
+			elseif policy == "contribution" then
+				local topPlayer, topCredit = nil, 0
+				for player, credit in building.credit or {} do
+					if credit > topCredit then
+						topPlayer = player
+						topCredit = credit
+					end
+				end
+				local share = topCredit / math.max(building.total, 1)
+				if topPlayer and share >= Config.Score.BonusMinShare then
+					giveBuildingBonus(topPlayer)
+				elseif deps.hudRemote then
+					deps.hudRemote:FireAllClients("notice", { text = "軍隊に破壊された" })
 				end
 			end
 			-- 建物崩壊の粉塵演出
@@ -375,11 +393,12 @@ end
 -- ctx = {
 --     position   = Vector3,   -- 必須
 --     radius     = number,    -- 必須
---     attacker   = Player?,   -- nil = 加点なし(将来: 敵の砲撃用)
+--     attacker   = Player?,   -- nil = 加点なし(敵の砲撃を含む)
 --     source     = string,    -- "Bazooka" / "Airstrike" / "RemoteBomb" など(演出・ログ用。Step0では未使用)
 --     scoreScale = number?,   -- 既定1。連鎖ボーナス倍率(下記の契約を参照)
 --     maxReal    = number?,   -- 既定 MAX_REAL_PER_EXPLOSION。1爆発あたりの物理化上限を絞りたい武器用
---     bonusPolicy= string?,   -- 既定 "normal"。"deny"で全壊ボーナスを誰にも与えない
+--     bonusPolicy= string?,   -- 既定 "normal"。"deny"=なし、"contribution"=首位貢献率で判定
+--     sourceEnemyModel=Model?,-- 敵が起こした爆発の発生元。EnemyManagerの自己被弾除外用
 --     silent     = boolean?,  -- 既定 false。true なら "explosion" エフェクトを送らない
 -- }
 --

@@ -1,0 +1,25 @@
+STEP3-v03 Kaiju Blockout generation report
+Status: PASS
+Blender: 5.2.0 LTS
+Forward axis: -Y
+Unit system: Metric / Meters / scale 1.0
+World bounds min: (-3.02, -3.16, -0.00)
+World bounds max: (3.02, 7.72, 10.00)
+Dimensions XYZ: (6.04, 10.88, 10.00) m
+Target height: 10.00 m
+Forward lean: 28.0 degrees
+Pose coordinates:
+Pelvis center: Y=0.62, Z=5.72
+Chest center: Y=-0.72, Z=7.96
+Head center: Y=-1.55, Z=9.15
+Hip: Y=0.68, Z=5.75
+Knee: Y=1.23, Z=3.17
+Ankle: Y=-0.12, Z=0.68
+Jaw heights / gap: 0.28 / 0.19 / 0.09 m
+Eye scale: 0.65; inset: 0.09 m
+Back_Haunch scale: (1.42, 1.22, 1.1)
+Tail_Base radii: (1.24, 1.05)
+Dorsal embed ratio: 35%
+Dorsal plates: 7
+Blockout objects: 56
+Required object check: PASS

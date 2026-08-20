@@ -1,0 +1,297 @@
+{
+  "joints": [
+    {
+      "name": "Neck",
+      "parentPart": "Torso",
+      "childPart": "Head",
+      "position": [
+        -0.1280440390110016,
+        -7.304870128631592,
+        10.620644569396973
+      ],
+      "distToParentCenter": 4.397906797337952,
+      "distToChildCenter": 1.2157720705595731,
+      "toleranceUsed": 0.05,
+      "matchedVertexPairs": 60,
+      "maxPairDistance": 0.0,
+      "hingeMode": false,
+      "hingeRatioUsed": null
+    },
+    {
+      "name": "Jaw",
+      "parentPart": "Head",
+      "childPart": "Jaw",
+      "position": [
+        -0.13527768850326538,
+        -8.48365592956543,
+        9.49118423461914
+      ],
+      "distToParentCenter": 1.223473421843712,
+      "distToChildCenter": 0.6585954259701782,
+      "toleranceUsed": 0.05,
+      "matchedVertexPairs": 43,
+      "maxPairDistance": 0.0,
+      "hingeMode": true,
+      "hingeRatioUsed": 0.15
+    },
+    {
+      "name": "L_Shoulder",
+      "parentPart": "Torso",
+      "childPart": "LeftUpperArm",
+      "position": [
+        1.6508865356445312,
+        -5.006290912628174,
+        9.513639450073242
+      ],
+      "distToParentCenter": 2.570720953213648,
+      "distToChildCenter": 0.7749922256284836,
+      "toleranceUsed": 0.05,
+      "matchedVertexPairs": 53,
+      "maxPairDistance": 0.0,
+      "hingeMode": false,
+      "hingeRatioUsed": null
+    },
+    {
+      "name": "L_Elbow",
+      "parentPart": "LeftUpperArm",
+      "childPart": "LeftLowerArm",
+      "position": [
+        2.649601459503174,
+        -4.616547584533691,
+        7.886053085327148
+      ],
+      "distToParentCenter": 1.2791245322583098,
+      "distToChildCenter": 1.2429476972588716,
+      "toleranceUsed": 0.05,
+      "matchedVertexPairs": 26,
+      "maxPairDistance": 0.0,
+      "hingeMode": false,
+      "hingeRatioUsed": null
+    },
+    {
+      "name": "R_Shoulder",
+      "parentPart": "Torso",
+      "childPart": "RightUpperArm",
+      "position": [
+        -1.9595985412597656,
+        -4.961595058441162,
+        8.83874797821045
+      ],
+      "distToParentCenter": 2.3902684363444253,
+      "distToChildCenter": 0.4801920249222941,
+      "toleranceUsed": 0.05,
+      "matchedVertexPairs": 55,
+      "maxPairDistance": 0.0,
+      "hingeMode": false,
+      "hingeRatioUsed": null
+    },
+    {
+      "name": "R_Elbow",
+      "parentPart": "RightUpperArm",
+      "childPart": "RightLowerArm",
+      "position": [
+        -2.7374486923217773,
+        -4.824582099914551,
+        7.821901321411133
+      ],
+      "distToParentCenter": 1.1471144295056088,
+      "distToChildCenter": 1.3401610920338143,
+      "toleranceUsed": 0.05,
+      "matchedVertexPairs": 18,
+      "maxPairDistance": 0.0,
+      "hingeMode": false,
+      "hingeRatioUsed": null
+    },
+    {
+      "name": "L_Hip",
+      "parentPart": "Torso",
+      "childPart": "LeftUpperLeg",
+      "position": [
+        1.1109102964401245,
+        -3.8975977897644043,
+        6.107853889465332
+      ],
+      "distToParentCenter": 2.6694201658702092,
+      "distToChildCenter": 1.390298523780127,
+      "toleranceUsed": 0.05,
+      "matchedVertexPairs": 51,
+      "maxPairDistance": 0.0,
+      "hingeMode": false,
+      "hingeRatioUsed": null
+    },
+    {
+      "name": "L_Knee",
+      "parentPart": "LeftUpperLeg",
+      "childPart": "LeftLowerLeg",
+      "position": [
+        1.9584527015686035,
+        -3.925490379333496,
+        3.1507351398468018
+      ],
+      "distToParentCenter": 1.7295879443049818,
+      "distToChildCenter": 1.2084400156284465,
+      "toleranceUsed": 0.05,
+      "matchedVertexPairs": 45,
+      "maxPairDistance": 0.0,
+      "hingeMode": false,
+      "hingeRatioUsed": null
+    },
+    {
+      "name": "R_Hip",
+      "parentPart": "Torso",
+      "childPart": "RightUpperLeg",
+      "position": [
+        -1.1939611434936523,
+        -3.9718668460845947,
+        6.115264892578125
+      ],
+      "distToParentCenter": 2.6051276668586003,
+      "distToChildCenter": 1.1037888264685345,
+      "toleranceUsed": 0.05,
+      "matchedVertexPairs": 42,
+      "maxPairDistance": 0.0,
+      "hingeMode": false,
+      "hingeRatioUsed": null
+    },
+    {
+      "name": "R_Knee",
+      "parentPart": "RightUpperLeg",
+      "childPart": "RightLowerLeg",
+      "position": [
+        -1.7292393445968628,
+        -4.106438159942627,
+        3.5798513889312744
+      ],
+      "distToParentCenter": 1.5461657215327682,
+      "distToChildCenter": 1.7120799203362733,
+      "toleranceUsed": 0.05,
+      "matchedVertexPairs": 42,
+      "maxPairDistance": 0.0,
+      "hingeMode": false,
+      "hingeRatioUsed": null
+    },
+    {
+      "name": "Tail_Root",
+      "parentPart": "Torso",
+      "childPart": "Tail1",
+      "position": [
+        -0.004354947246611118,
+        -1.2730951309204102,
+        6.46291971206665
+      ],
+      "distToParentCenter": 2.969397717639702,
+      "distToChildCenter": 2.0153695695954807,
+      "toleranceUsed": 0.05,
+      "matchedVertexPairs": 52,
+      "maxPairDistance": 0.0,
+      "hingeMode": false,
+      "hingeRatioUsed": null
+    },
+    {
+      "name": "Tail_Mid",
+      "parentPart": "Tail1",
+      "childPart": "Tail2",
+      "position": [
+        -0.06659114360809326,
+        0.9605366587638855,
+        3.1770737171173096
+      ],
+      "distToParentCenter": 2.050705692383802,
+      "distToChildCenter": 1.835255352784668,
+      "toleranceUsed": 0.05,
+      "matchedVertexPairs": 40,
+      "maxPairDistance": 0.0,
+      "hingeMode": false,
+      "hingeRatioUsed": null
+    },
+    {
+      "name": "Tail_Tip",
+      "parentPart": "Tail2",
+      "childPart": "Tail3",
+      "position": [
+        -0.026959272101521492,
+        4.962182521820068,
+        1.8735525608062744
+      ],
+      "distToParentCenter": 2.373670841802945,
+      "distToChildCenter": 2.3248293651561633,
+      "toleranceUsed": 0.05,
+      "matchedVertexPairs": 28,
+      "maxPairDistance": 0.0,
+      "hingeMode": false,
+      "hingeRatioUsed": null
+    }
+  ],
+  "partCenters": {
+    "Torso": [
+      -0.12206447124481201,
+      -3.485999345779419,
+      8.439412117004395
+    ],
+    "Head": [
+      -0.0034104585647583008,
+      -8.511134147644043,
+      10.707220077514648
+    ],
+    "Jaw": [
+      -0.02445286512374878,
+      -9.115886688232422,
+      9.638663291931152
+    ],
+    "LeftUpperArm": [
+      2.2668581008911133,
+      -5.004323482513428,
+      9.043333053588867
+    ],
+    "LeftLowerArm": [
+      2.7206320762634277,
+      -4.994442462921143,
+      6.704076290130615
+    ],
+    "RightUpperArm": [
+      -2.4099652767181396,
+      -5.123003005981445,
+      8.879999160766602
+    ],
+    "RightLowerArm": [
+      -2.656489372253418,
+      -5.0128092765808105,
+      6.497496604919434
+    ],
+    "LeftUpperLeg": [
+      1.526620626449585,
+      -3.6549134254455566,
+      4.803545951843262
+    ],
+    "LeftLowerLeg": [
+      2.3442773818969727,
+      -4.120692729949951,
+      2.022301435470581
+    ],
+    "RightUpperLeg": [
+      -1.5437978506088257,
+      -3.796325206756592,
+      5.08320426940918
+    ],
+    "RightLowerLeg": [
+      -2.295921802520752,
+      -4.129544258117676,
+      1.9644397497177124
+    ],
+    "Tail1": [
+      -0.04386013746261597,
+      -0.5229121446609497,
+      4.592791557312012
+    ],
+    "Tail2": [
+      -0.04211500287055969,
+      2.700615406036377,
+      2.594244956970215
+    ],
+    "Tail3": [
+      0.133315771818161,
+      7.280197620391846,
+      1.7964210510253906
+    ]
+  }
+}

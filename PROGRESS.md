@@ -1203,6 +1203,81 @@ C-5(火・煙。フェーズB)は今回のスコープ外。
 
 ---
 
+# 固定MAP対応 Phase 3-2 ★3 Tank(2026-08-14)
+
+## 実装内容
+
+- Toolbox元アセット`15081095657`を対象Studioの`ServerStorage.EnemyModels.Tank`へ挿入。
+  ローカル`tank.rbxm`の静的解析では217 BasePart、Script 0件だったが、Robloxからの挿入版には
+  `Tank.Model.Seat.Script`が1件含まれていた。テンプレート原本は保持し、Clone後に全Luaコードを
+  WorkspaceへParentする前に削除する安全化を実装した。
+- `Body="model"`汎用ローダー、PrimaryPartフォールバック、最高BasePartへのマーカー、全BasePartの
+  固定/非衝突/Query設定、PivotTo移動、ModelYawOffsetを追加。実機比較で`-90`を確定した。
+- Tankのプレイヤー砲撃、建物砲撃、自己爆風除外、HitRadius=6、3発耐久、0.65秒同時フェードを実装。
+- DestructionManagerへ建物ごとのプレイヤー貢献数を追加。敵が全壊ラインを越えた場合、最多貢献率
+  50%以上なら500点/+10秒、未満ならボーナスなし＋全員通知にした。
+- ★3(Threshold=10000、Tank×2、RespawnDelay=25)とMaxLossPerMinute=30を追加。
+
+## 検証結果
+
+- `rojo build default.project.json`成功、`git diff --check`成功。
+- Studio ★3: Tank×2、各217 BasePart、Clone内Script 0、全Anchored、CanCollide/CanTouchなし、全CanQueryを確認。
+- 向き: 1秒間の移動ベクトルと砲身方向の内積`0.9979`で前進方向との一致を確認。
+- 建物砲撃: 5秒間で`Destructible`が51個減少。Tank周辺90stud・MaxParts=50の候補取得も確認。
+- プレイヤー砲撃: HUDで`-6秒`(2発分)を確認。ラウンド末尾だったため1発単位の時間差再計測は未実施。
+- 3回被弾: 全217パーツのTransparencyが同値で進行し、約0.65秒後にモデルが消えることを確認。
+- 貢献度隔離テスト: 5/10(50%)で500点/+10秒、4/10(40%)でボーナスなし＋通知1回を確認。
+- 回帰: ★1はPoliceCar×2+PoliceOfficer×2、★2はSoldier×4+Sniper×2を確認。新規スクリプトエラーなし。
+  既知の権限切れ/アーカイブ済みSoundと固定MAP TexturePack警告は継続。
+
+## 未検証・申し送り
+
+- タブレット実機のfps/メモリ。Tankは1台217パーツのため、★3長時間プレイと25秒再派遣を実機確認する。
+- プレイヤーが予告線を見て半径10外へ移動した場合の回避はコード経路のみ確認し、手動プレイでは未確認。
+  損失キャップは`RoundClock.Add(-1)`を40回呼ぶ隔離テストで適用合計`-30`・残り約90秒を確認済み。
+- 新規Placeでは`SETUP.md`の手順どおりTankアセットを手動挿入する必要がある。
+
+---
+
+# 固定MAP対応 Phase 3-2a ラウンド開始位置・敵接地・ヘリ投下ライン(2026-08-14)
+
+## 実装内容
+
+- `GameManager.server.lua`に`respawnPlayersForRound()`を追加。旧ラウンド状態のClear、
+  `MapRuntime.LoadRound()`、Enemy/NPC/DestructionのMapContext接続完了後、LOBBYカウント開始前に
+  参加中Playerへ`LoadCharacter()`を実行する。
+- `EnemyManager`の敵stateへ個体別`standingY`を追加。PoliceOfficer / Soldierは停止中、Sniperは
+  stationary中にXZを維持したままその個体のYへ補正する。降下Soldierは着地時Yを`standingY`へ引き継ぐ。
+- PoliceCar / Tankは経路更新時に`roadStandingY`を破棄し、目的地到着時の走行Yを保存して停車中も維持する。
+  車種共通の固定Yは導入せず、既存`groundOffsetY`と道路経路をそのまま使う。
+- ヘリ設定を`DropInterval=1.0`へ変更し、`DropRunSpeed=30`を追加。dropPoint到着後、exit方向へ
+  低速前進しながら現在位置基準でSoldierを投下する。Sniperの到着時配置は1回のまま。
+- transport継続条件を`canContinueTransport()`へ集約し、Heartbeatごとにcancel、roundToken、
+  aggressive、retired squad、Model生存を確認する。投下走行は`heliFlyForDuration()`で行い、
+  ★昇格・BATTLE終了後の遅延Soldier生成を止める。
+
+## 検証結果
+
+- `rojo build default.project.json`成功。
+- RESULTでCharacterを`(5000, 500, 5000)`へ移動後「次へ」を送信し、新Characterが
+  `SpawnLocation`付近へ生成された。検証属性は旧Characterとともに消え、武器は3種各1個だった。
+- PoliceOfficerは停止後8秒、Soldierは着地・停止後8秒、Sniperは接地安定後8秒、PoliceCar / Tankは
+  道路到着後6秒を計測し、全対象でY差0・XZ差0だった。
+- ★2のSoldier生成間隔は`1.00 / 1.00 / 1.03秒`、隣接XZ距離は
+  `27.7 / 31.9 / 34.2 studs`。`LandingSpread=6`を含むため中心値30前後として仕様どおり。
+- ★2の1人目投下直後に★3へ昇格し、6秒後も旧squadのSoldierは1人のまま、旧ヘリ0、Tank 2台を確認。
+- 通常サーバーScriptからBATTLE終了相当の`SetAggressive(false)`を1人目投下直後に実行し、
+  6秒後もSoldierは1人、ヘリ0を確認。今回実装由来の新規コンソールエラーは無かった。
+
+## 申し送り
+
+- Sniperは生成直後にHumanoid/R15の初回接地調整として約2.17 studsのY変化を1回観測したが、
+  その後8秒間は屋上Yを維持した。地上への継続沈下・ワープは発生していない。
+- Sound権限切れ、アーカイブ済みSound、固定MAP TexturePackの既知警告は継続している。
+- タブレット実機での見た目、約30-stud投下間隔の体感、fps/メモリは未確認。
+
+---
+
 # 固定MAP対応 Phase 1(2026-08-08)
 
 ## 実装内容
@@ -1242,3 +1317,37 @@ C-5(火・煙。フェーズB)は今回のスコープ外。
   `BuildingId`を削除して残骸キューへ登録するようにした
 - 修正後の実プレイで、残骸が混ざった建物を90%以上破壊したとき、
   **建物全壊500点**と**タイマー+10秒**が正常に1回だけ発生することを確認
+
+## 既知未解決: RESULTから次ラウンド開始時の状態引き継ぎ
+
+### 症状
+
+1ラウンド目を終了してRESULT画面の「次へ」を押すと、次ラウンドが完全な初期状態から
+始まらず、前ラウンド終了時点の状態を一部引き継いだように再開することがある。
+
+### 対応方針
+
+この問題は現在の個別Metadata Phaseでは修正しない。`EnemySpawns` / `RoadNodes` /
+`SniperSpawns` / `BossSpawns`等、固定MAP依存Metadataの対応完了後に、
+**固定MAP対応・ラウンド再初期化／総合統合Phase**を設けて、原因確認から最小変更で修正する。
+現在はGameManager・RoundState・MapRuntimeのラウンド境界処理を変更しない。
+
+### 後続Phaseの調査項目
+
+- RESULTの「次へ」入力から新ラウンド開始までの処理経路
+- `GameManager`の`LOBBY`/`BATTLE`/`RESULT`遷移と、停止済みラウンドの再開になっていないか
+- `MapRuntime.LoadRound()`の再実行、旧`workspace.Map`の破棄、
+  `ServerStorage.FixedMapTemplate`原本の未変更性
+- `DestructionManager`のDebris/Rubble/building進捗状態
+- `EnemyManager`の敵・撤退敵・pending deployment・transport状態
+- `ThreatManager`のstage/squad/timer状態、`RoundClock`、`WeaponServer`等のラウンド単位状態
+- Client側UIに前ラウンド状態が残っていないか
+
+コード確認だけでなくStudio実機でも確認し、原因を決め打ちしない。
+
+### 受け入れ基準
+
+最低3ラウンド連続で、各ラウンド中に複数建物を破壊してRESULTへ移行し、「次へ」で新ラウンドを
+開始する。毎回、未破壊MAP、瓦礫・残骸、敵・輸送機、Threat、`RoundClock`、仕様上リセットされる
+スコア等、固定MAP Metadataの再読込、およびOutputの新規エラーなしを、見た目だけでなく内部状態も
+含めて確認する。

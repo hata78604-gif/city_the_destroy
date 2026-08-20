@@ -1,0 +1,19 @@
+local Selection = game:GetService("Selection")
+
+local selected = Selection:Get()
+local totalParts = 0
+
+for _, obj in ipairs(selected) do
+	for _, descendant in ipairs(obj:GetDescendants()) do
+		if descendant:IsA("BasePart") then
+			totalParts += 1
+		end
+	end
+
+	-- 選択したもの自体がPartの場合
+	if obj:IsA("BasePart") then
+		totalParts += 1
+	end
+end
+
+print("選択中の総パーツ数:", totalParts)

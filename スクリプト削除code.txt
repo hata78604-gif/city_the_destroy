@@ -1,0 +1,73 @@
+local Selection = game:GetService("Selection")
+
+--------------------------------------------------------------------
+-- カウント
+--------------------------------------------------------------------
+
+local deletedCount = 0
+local disabledSeatCount = 0
+
+--------------------------------------------------------------------
+-- 選択したModelを処理
+--------------------------------------------------------------------
+
+for _, selected in ipairs(Selection:Get()) do
+	if selected:IsA("Model") then
+
+		-- GetDescendants() は先に一覧を作るので、
+		-- 途中でDestroyしても基本的に問題ありません
+		for _, obj in ipairs(selected:GetDescendants()) do
+
+			----------------------------------------------------------------
+			-- 削除対象
+			----------------------------------------------------------------
+
+			if obj:IsA("Script")
+				or obj:IsA("LocalScript")
+				or obj:IsA("ModuleScript")
+				or obj:IsA("RemoteEvent")
+				or obj:IsA("RemoteFunction")
+				or obj:IsA("BindableEvent")
+				or obj:IsA("BindableFunction")
+				or obj:IsA("ClickDetector")
+				or obj:IsA("ProximityPrompt") then
+
+				print(
+					"削除:",
+					obj.ClassName,
+					obj:GetFullName()
+				)
+
+				obj:Destroy()
+				deletedCount += 1
+
+			----------------------------------------------------------------
+			-- Seat / VehicleSeat は削除せず無効化
+			----------------------------------------------------------------
+
+			elseif obj:IsA("Seat") or obj:IsA("VehicleSeat") then
+
+				if not obj.Disabled then
+					obj.Disabled = true
+					disabledSeatCount += 1
+
+					print(
+						"Seat無効化:",
+						obj.ClassName,
+						obj:GetFullName()
+					)
+				end
+			end
+		end
+	end
+end
+
+--------------------------------------------------------------------
+-- 完了
+--------------------------------------------------------------------
+
+print("--------------------------------------------------")
+print("Toolboxモデルの無害化 完了")
+print("削除したオブジェクト: " .. deletedCount .. " 個")
+print("無効化したSeat: " .. disabledSeatCount .. " 個")
+print("--------------------------------------------------")

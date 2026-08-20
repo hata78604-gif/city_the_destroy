@@ -1,0 +1,20 @@
+STEP3-v07 Face Revision Report
+Status: PASS
+Scope: face only; v06 legs, tail and arms unchanged
+Face builder: independent v07 head replacement
+Blender: 5.2.0 LTS
+Forward axis: -Y
+Bounds min: (-2.68, -3.34, 0.00)
+Bounds max: (2.68, 8.00, 10.00)
+Dimensions XYZ: (5.35, 11.34, 10.00) m
+Face anchors:
+  Cranium: (0.00, -1.88, 8.78)
+  UpperSnout rear/front Y: -1.84 / -3.34
+  LowerJaw rear/front Y: -1.86 / -3.24
+  LowerJaw gap target: 0.035 m
+Validation: PASS
+Self-evaluation:
+  1. Tail spines: DEFERRED (unchanged from v06)
+  2. Leg connection: PASS (preserved v06)
+  3. Elbow bend: DEFERRED (unchanged from v06)
+  4. Crocodilian face: PASS

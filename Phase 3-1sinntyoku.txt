@@ -1,0 +1,32 @@
+Phase 3-1 R15 Enemy Rig を実装しました。
+
+- `PoliceOfficer` / `Soldier` / `Sniper` を `Body = "rig"` と `RigTemplate` 指定へ変更。
+- `ServerStorage.EnemyModels` のR15テンプレートを検証してClone。欠落時は軽量Bodyへフォールバックせず警告します。
+- `enemy.core = HumanoidRootPart`、`markerAnchor = Head`。
+- BodyPartはRaycast対象、Visual/Accessoryは `CanQuery=false` を維持。
+- HumanoidのHPは使用せず、既存の `Hits`・撃破・報酬・攻撃ロジックを維持。
+- R15は非Anchoredのまま重力補償し、既存 `PivotTo` の追跡・降下・撤退を継続。
+- R15死亡時はMotor6Dを壊さない簡易ダウン姿勢にし、Raycastを遮らず一定時間後に削除。
+- Animationは今回はなし（既存移動との競合を避ける最小・安定方針）。
+
+変更ファイル：
+
+- [Config.lua](C:\Dokumen\ロブロックス破壊ゲーム_codex\ReplicatedStorage\Config.lua)
+- [EnemyManager.lua](C:\Dokumen\ロブロックス破壊ゲーム_codex\ServerScriptService\Modules\EnemyManager.lua)
+
+Studio Play 確認済み：
+
+- ★1でR15警官とパトカー降車を確認。
+- ★2でR15スナイパー2体、R15兵士4体を確認。
+- 兵士は着地後 `Deploying=false`、主要BodyPartのRaycast有効、Visual非対象。
+- スナイパーは1秒間の水平移動 `0.000` stud。
+- ★1→★2昇格時の既存Retreat開始もログで確認。
+- 新規Placeは作成していません。
+
+検証：
+
+- `rojo build`: 成功
+- `git diff --check`: 成功
+- `luau-lsp`: 日本語パスのsourcemap解決不具合により完走不可（Studio Play上では今回のコード構文エラーなし）
+
+Studio側のテンプレートは既存の `ServerStorage.EnemyModels` をそのまま利用しています。

@@ -15,6 +15,8 @@ local RunService = game:GetService("RunService")
 local Players = game:GetService("Players")
 local TweenService = game:GetService("TweenService")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local ServerStorage = game:GetService("ServerStorage")
+local CollectionService = game:GetService("CollectionService")
 
 local Config = require(ReplicatedStorage:WaitForChild("Config"))
 
@@ -23,7 +25,8 @@ local rng = Random.new()
 
 -- Init()で注入される依存:
 -- { addScore(player,points,category), addTime(delta,reason,player)->applied, getRemaining()->number,
---   roadLines(配列 or nil), effectRemote, hudRemote }
+--   effectRemote, hudRemote, explode(ctx) }
+-- MAP依存情報はラウンドごとにSetMapContext()で別途設定する。
 local deps = nil
 
 local folder = nil -- workspace.Enemies(初回spawnEnemyで遅延生成)
@@ -32,10 +35,15 @@ local playerState = {} -- playerState[player] = { invincibleUntil }
 local killCounts = {} -- killCounts[player] = number(倒した敵の合計数。種類は問わない)
 local aggressive = false -- ThreatManager.Start/Stopで切り替わる(移動・攻撃の可否)
 local roundToken = 0 -- Clear()のたびに+1。task.delayコールバックの世代確認に使う
-local spawnPoints = {} -- 道路交点の座標リスト(Init時に一度だけ計算)
-local systemDisabled = false -- roadLinesがnil/空だった場合にtrue(warn1回・以降no-op)
-local savedRoadLines = {} -- 道路中心線の配列(Init時に保存。Movement=="road"の経路計算に使う)
-local cityBounds = 0 -- 街の外周座標の絶対値。roadLines[#roadLines]から導出(下記Init参照)
+local currentMap = nil -- SetMapContextで受け取った、そのラウンドのworkspace.Map
+local spawnPoints = {} -- MapContext.enemySpawnPointsのVector3コピー。marker Instanceは保持しない
+local mapBounds = nil -- { minX, maxX, minZ, maxZ }の数値コピー
+local mapCenter = nil -- bounds中心のVector3(Phase 2-2では保持のみ。後続Phaseから利用可能)
+local systemDisabled = true -- 有効なMapContextが設定されるまで敵生成を安全に停止する
+local roadNetwork = nil -- MapContext.roadNetwork。RoadNode座標と明示Linksだけを使用する
+local roadNavigationWarned = false
+local sniperSpawnPoints = {} -- MapContext.sniperSpawnPointsの{name, position}コピー
+local occupiedSniperSpawns = {} -- [spawnName]=true。生成予約中と生存中の両方を表す
 -- 撤退済み部隊の集合(Step5-0)。retiredSquads[squadId]=true。このsquadIdからの新規生成を
 -- spawnEnemy/DeploySquadの両方で防ぐ。Clear()でリセットしないと次ラウンドでsquadIdが
 -- 再利用されたときに誤って撤退済み扱いになる
@@ -53,22 +61,20 @@ local pendingDeployments = {}
 -- RetreatSquad/Clearから中断できるようにするための機構のみで、ヘリ自体はenemiesに入れない
 local activeTransports = {}
 local transportFolder = nil -- workspace.EnemyTransports(初回ヘリ生成時に遅延生成)
+local rigTemplates = {} -- ServerStorage.EnemyModelsから検証済みのR15テンプレート
+local warnedRigTemplateIssues = {}
+local modelTemplates = {} -- ServerStorage.EnemyModelsから検証済みの汎用Modelテンプレート
+local warnedModelTemplateIssues = {}
+local warnedModelFallbacks = {}
 
 local THINK_INTERVAL = 0.2 -- 標的の再選択・攻撃判定を行う頻度(移動自体は毎フレーム)
 
---------------------------------------------------------------------
--- 湧き位置の計算(道路中心線の直積 = 交点)
---------------------------------------------------------------------
-local function computeSpawnPoints(roadLines)
-	local points = {}
-	for _, x in roadLines do
-		for _, z in roadLines do
-			-- Y=3はここでは意味を持たない仮値。実際の接地Yはspawnenemy側で
-			-- etype.SpawnY(敵種別ごとの値)により必ず上書きされる(体格が違うため)
-			table.insert(points, Vector3.new(x, 3, z))
-		end
+local function releaseSniperSpawn(enemy)
+	local spawnName = enemy.sniperSpawnName
+	if spawnName then
+		occupiedSniperSpawns[spawnName] = nil
+		enemy.sniperSpawnName = nil
 	end
-	return points
 end
 
 -- 指定地点から最も近い生存プレイヤーとの水平距離
@@ -86,9 +92,9 @@ local function nearestPlayerDist(point)
 	return nearest
 end
 
--- usedPoints(手順6)のキー生成。spawnPointsは同一のVector3群から来るため文字列化で比較できる
+-- usedPoints(手順6)のキー生成。異なる高さに同じX/Zのmarkerがある場合も別候補として扱う
 local function pointKey(point)
-	return ("%.1f,%.1f"):format(point.X, point.Z)
+	return ("%.1f,%.1f,%.1f"):format(point.X, point.Y, point.Z)
 end
 
 -- 湧き位置を1つ選ぶ: MinDistanceFromPlayer以上離れた点のうち、最も近い3点からランダムに1つ。
@@ -96,6 +102,9 @@ end
 -- usedPointsを渡すと、そこに登録済みの点を優先的に除外する(手順6: パトカー同士の交差点重複防止)。
 -- 除外した結果候補が0件になった場合はMinDistanceFromPlayerの方は諦めず、除外だけを諦めて選び直す
 local function pickSpawnPoint(usedPoints)
+	if #spawnPoints == 0 then
+		return nil
+	end
 	local minDist = Config.Threat.Spawn.MinDistanceFromPlayer
 	local scored = {}
 	for _, point in spawnPoints do
@@ -145,6 +154,274 @@ local function makePart(size, cf, parent, name, color, material)
 	p.CastShadow = false
 	p.Parent = parent
 	return p
+end
+
+local function forEachModelBasePart(model, callback)
+	for _, descendant in model:GetDescendants() do
+		if descendant:IsA("BasePart") then
+			callback(descendant)
+		end
+	end
+end
+
+local function isRigVisualPart(part)
+	return part:FindFirstAncestor("Visuals") ~= nil
+		or part:FindFirstAncestorOfClass("Accessory") ~= nil
+end
+
+local function warnRigTemplateIssue(templateName, message)
+	local key = templateName .. ":" .. message
+	if warnedRigTemplateIssues[key] then
+		return
+	end
+	warnedRigTemplateIssues[key] = true
+	warn(("[EnemyManager] R15テンプレート '%s' を使えません: %s"):format(templateName, message))
+end
+
+local function findRigTemplate(templateName)
+	if typeof(templateName) ~= "string" or templateName == "" then
+		warnRigTemplateIssue(tostring(templateName), "RigTemplate が未設定です")
+		return nil
+	end
+
+	local enemyModels = ServerStorage:FindFirstChild("EnemyModels")
+	if not enemyModels or not enemyModels:IsA("Folder") then
+		warnRigTemplateIssue(templateName, "ServerStorage.EnemyModels がありません")
+		return nil
+	end
+
+	local template = enemyModels:FindFirstChild(templateName)
+	if not template or not template:IsA("Model") then
+		warnRigTemplateIssue(templateName, "Model がありません")
+		return nil
+	end
+
+	local humanoid = template:FindFirstChildOfClass("Humanoid")
+	local root = template:FindFirstChild("HumanoidRootPart", true)
+	local head = template:FindFirstChild("Head", true)
+	if not humanoid then
+		warnRigTemplateIssue(templateName, "Humanoid がありません")
+		return nil
+	end
+	if humanoid.RigType ~= Enum.HumanoidRigType.R15 then
+		warnRigTemplateIssue(templateName, "Humanoid.RigType が R15 ではありません")
+		return nil
+	end
+	if not root or not root:IsA("BasePart") then
+		warnRigTemplateIssue(templateName, "HumanoidRootPart がありません")
+		return nil
+	end
+	if not head or not head:IsA("BasePart") then
+		warnRigTemplateIssue(templateName, "Head がありません")
+		return nil
+	end
+
+	rigTemplates[templateName] = template
+	return template
+end
+
+local function getRigTemplate(templateName)
+	local template = rigTemplates[templateName]
+	if template and template.Parent then
+		return template
+	end
+	return findRigTemplate(templateName)
+end
+
+local function warnModelTemplateIssue(templateName, message)
+	local key = tostring(templateName) .. ":" .. message
+	if warnedModelTemplateIssues[key] then
+		return
+	end
+	warnedModelTemplateIssues[key] = true
+	warn(("[EnemyManager] Modelテンプレート '%s' を使えません: %s"):format(tostring(templateName), message))
+end
+
+local function findModelTemplate(templateName)
+	if typeof(templateName) ~= "string" or templateName == "" then
+		warnModelTemplateIssue(templateName, "ModelTemplate が未設定です")
+		return nil
+	end
+
+	local enemyModels = ServerStorage:FindFirstChild("EnemyModels")
+	if not enemyModels or not enemyModels:IsA("Folder") then
+		warnModelTemplateIssue(templateName, "ServerStorage.EnemyModels がありません")
+		return nil
+	end
+
+	local template = enemyModels:FindFirstChild(templateName)
+	if not template or not template:IsA("Model") then
+		warnModelTemplateIssue(templateName, "Model がありません")
+		return nil
+	end
+
+	local hasBasePart = false
+	for _, descendant in template:GetDescendants() do
+		if descendant:IsA("BasePart") then
+			hasBasePart = true
+			break
+		end
+	end
+	if not hasBasePart then
+		warnModelTemplateIssue(templateName, "BasePart が1個もありません")
+		return nil
+	end
+
+	modelTemplates[templateName] = template
+	return template
+end
+
+local function getModelTemplate(templateName)
+	local template = modelTemplates[templateName]
+	if template and template.Parent then
+		return template
+	end
+	return findModelTemplate(templateName)
+end
+
+local function warnModelFallbackOnce(templateName, part)
+	if warnedModelFallbacks[templateName] then
+		return
+	end
+	warnedModelFallbacks[templateName] = true
+	warn(("[EnemyManager] Modelテンプレート '%s' に有効なPrimaryPartが無いため '%s' をcoreに使います")
+		:format(templateName, part:GetFullName()))
+end
+
+local function prepareGenericModel(model, templateName)
+	-- Toolbox由来コードはWorkspaceへ入る前に必ず除去する。
+	for _, descendant in model:GetDescendants() do
+		if descendant:IsA("Script") or descendant:IsA("LocalScript") or descendant:IsA("ModuleScript") then
+			descendant:Destroy()
+		end
+	end
+
+	local core = model.PrimaryPart
+	if not core or not core:IsA("BasePart") or not core:IsDescendantOf(model) then
+		core = model:FindFirstChildWhichIsA("BasePart", true)
+		if not core then
+			warnModelTemplateIssue(templateName, "Clone後に BasePart を取得できません")
+			return nil, nil
+		end
+		warnModelFallbackOnce(templateName, core)
+	end
+	model.PrimaryPart = core
+
+	local markerAnchor = core
+	local highestTop = -math.huge
+	forEachModelBasePart(model, function(part)
+		part.Anchored = true
+		part.CanCollide = false
+		part.CanTouch = false
+		part.CanQuery = true
+		local top = part.Position.Y + part.Size.Y * 0.5
+		if top > highestTop then
+			highestTop = top
+			markerAnchor = part
+		end
+	end)
+
+	return core, markerAnchor
+end
+
+-- 汎用Modelの外形を覆う透明Hitboxを作る。爆風判定はこの箱までの最短距離で行うため、
+-- PrimaryPart未設定のToolboxモデルでも車体の端や砲塔を安定して狙える。
+local function createModelHitbox(model)
+	local boundsCf, boundsSize = model:GetBoundingBox()
+	local hitbox = Instance.new("Part")
+	hitbox.Name = "DamageHitbox"
+	hitbox.Size = boundsSize
+	hitbox.CFrame = boundsCf
+	hitbox.Transparency = 1
+	hitbox.Anchored = true
+	hitbox.CanCollide = false
+	hitbox.CanTouch = false
+	hitbox.CanQuery = false -- 武器Raycastを遮らず、EnemyManager.OnExplosionだけが使う
+	hitbox.CastShadow = false
+	hitbox:SetAttribute("EnemyDamageHitbox", true)
+	hitbox.Parent = model
+	return hitbox
+end
+
+local function setRigQueryEnabled(model, enabled)
+	forEachModelBasePart(model, function(part)
+		if not isRigVisualPart(part) then
+			part.CanQuery = enabled
+		end
+	end)
+end
+
+-- 既存EnemyManagerのCFrame/PivotTo移動とR15 Humanoidの自動状態遷移を競合させない。
+-- アンカーで固定せず、重力だけを相殺して標準R15 Assemblyのまま移動させる。
+local function prepareRigForCustomMovement(model, core)
+	local humanoid = model:FindFirstChildOfClass("Humanoid")
+	if humanoid then
+		humanoid.AutoRotate = false
+		humanoid.WalkSpeed = 0
+		humanoid.JumpPower = 0
+		humanoid.JumpHeight = 0
+		humanoid.BreakJointsOnDeath = false
+		humanoid.DisplayDistanceType = Enum.HumanoidDisplayDistanceType.None
+		pcall(function()
+			humanoid.EvaluateStateMachine = false
+		end)
+	end
+
+	forEachModelBasePart(model, function(part)
+		part.Anchored = false
+		part.CanCollide = false
+		part.CanTouch = false
+		part.CanQuery = not isRigVisualPart(part)
+		if isRigVisualPart(part) then
+			part.Massless = true
+		end
+	end)
+
+	local attachment = core:FindFirstChild("EnemyAntiGravityAttachment")
+	if not attachment then
+		attachment = Instance.new("Attachment")
+		attachment.Name = "EnemyAntiGravityAttachment"
+		attachment.Parent = core
+	end
+	local force = attachment:FindFirstChild("EnemyAntiGravity")
+	if not force then
+		force = Instance.new("VectorForce")
+		force.Name = "EnemyAntiGravity"
+		force.Attachment0 = attachment
+		force.ApplyAtCenterOfMass = true
+		force.RelativeTo = Enum.ActuatorRelativeTo.World
+		force.Parent = attachment
+	end
+	force.Force = Vector3.new(0, core.AssemblyMass * workspace.Gravity, 0)
+	pcall(function()
+		core:SetNetworkOwner(nil)
+	end)
+end
+
+local function stabilizeRig(enemy)
+	if not enemy.isRig or not enemy.core or enemy.core.Anchored then
+		return
+	end
+	enemy.core.AssemblyLinearVelocity = Vector3.zero
+	enemy.core.AssemblyAngularVelocity = Vector3.zero
+end
+
+local function prepareRigCorpse(enemy)
+	local humanoid = enemy.model:FindFirstChildOfClass("Humanoid")
+	if humanoid then
+		humanoid.AutoRotate = false
+		humanoid.PlatformStand = true
+	end
+	forEachModelBasePart(enemy.model, function(part)
+		part.CanCollide = false
+		part.CanTouch = false
+		part.CanQuery = false
+	end)
+	local pivot = enemy.model:GetPivot()
+	enemy.model:PivotTo(pivot * CFrame.Angles(0, 0, math.rad(78)))
+	enemy.core.AssemblyLinearVelocity = Vector3.zero
+	enemy.core.AssemblyAngularVelocity = Vector3.zero
+	enemy.core.Anchored = true -- 死体だけを短時間固定し、Motor6Dを壊さずに倒れ姿勢を維持する
 end
 
 -- 頭上マーカー(BillboardGui)。NPCManager.createHelpBubbleと同じ方式:
@@ -205,9 +482,60 @@ local function buildCarBody(model, rootCf, etype)
 	return core, cabin
 end
 
+-- EnemySpawn markerは敵Rootではなく地面の表面を表す。
+-- R15 HumanoidはHipHeightを使って足裏を合わせ、現在の軽量リグなど
+-- Humanoidを持たないモデルはBoundingBox下端を地面へ合わせる。
+-- 現在の固定MAPだけを対象に、指定XZ直下の表面Yを返す。EnemySpawn marker自身はCanQuery=falseなのでヒットしない。
+local function findGroundSurfaceY(position)
+	if not currentMap then
+		return nil
+	end
+	local params = RaycastParams.new()
+	params.FilterType = Enum.RaycastFilterType.Include
+	params.FilterDescendantsInstances = { currentMap }
+	local origin = Vector3.new(position.X, position.Y + 200, position.Z)
+	local result = workspace:Raycast(origin, Vector3.new(0, -500, 0), params)
+	return result and result.Position.Y or nil
+end
+
+local function alignModelFeetToGround(model, groundY)
+	local humanoid = model:FindFirstChildOfClass("Humanoid")
+	local humanoidRootPart = model:FindFirstChild("HumanoidRootPart", true)
+	local deltaY
+
+	if humanoid
+		and humanoid.RigType == Enum.HumanoidRigType.R15
+		and humanoidRootPart
+		and humanoidRootPart:IsA("BasePart")
+	then
+		local lowestFootY = math.huge
+		for _, footName in { "LeftFoot", "RightFoot" } do
+			local foot = model:FindFirstChild(footName, true)
+			if foot and foot:IsA("BasePart") then
+				lowestFootY = math.min(lowestFootY, foot.Position.Y - foot.Size.Y * 0.5)
+			end
+		end
+		if lowestFootY < math.huge then
+			deltaY = groundY - lowestFootY
+		else
+			local desiredRootY = groundY + humanoid.HipHeight + humanoidRootPart.Size.Y * 0.5
+			deltaY = desiredRootY - humanoidRootPart.Position.Y
+		end
+	else
+		local boundingBoxCf, boundingBoxSize = model:GetBoundingBox()
+		local currentFeetY = boundingBoxCf.Position.Y - boundingBoxSize.Y * 0.5
+		deltaY = groundY - currentFeetY
+	end
+
+	if math.abs(deltaY) > 1e-4 then
+		model:PivotTo(model:GetPivot() + Vector3.new(0, deltaY, 0))
+	end
+end
+
 -- 個体生成の単一入口。警官の生成経路はここだけにする(Step3のパトカー降車、Step5-1のヘリ降下もこれを通す)。
 -- squadIdの付け忘れが構造的に起きないようにするため。
--- options(任意。Step5-1で追加): { deploying=true, deployFromY=number, suppressSpawnEffect=true }。
+-- options(任意): { deploying=true, deployFromY=number, suppressSpawnEffect=true,
+--   alignToGround=true }。alignToGroundは固定MAPのspawn markerを地面の表面として扱う。
 -- 省略時(第4引数なし)は既存呼び出しと完全に同じ挙動を維持する
 local function spawnEnemy(typeName, position, squadId, options)
 	if systemDisabled then
@@ -226,7 +554,7 @@ local function spawnEnemy(typeName, position, squadId, options)
 	-- Bodyの妥当性はここで確定させる(既知の値以外は個体を作らず1体諦める)。
 	-- Step5(ヘリ)・Step6(戦車)でも同じ仕組みで守られるよう、Bodyが増えるたびに
 	-- ここへ1行足すだけで済む形にしてある
-	if etype.Body ~= "human" and etype.Body ~= "car" then
+	if etype.Body ~= "human" and etype.Body ~= "car" and etype.Body ~= "rig" and etype.Body ~= "model" then
 		warn(("[EnemyManager] 未知のBody '%s' (タイプ '%s') が指定されました。この個体はスキップします")
 			:format(tostring(etype.Body), typeName))
 		return nil
@@ -238,35 +566,81 @@ local function spawnEnemy(typeName, position, squadId, options)
 		folder.Parent = workspace
 	end
 
-	local model = Instance.new("Model")
-	model.Name = etype.DisplayName
-
-	-- 接地Y座標は敵種別ごとに異なる(体格が違うため)データ駆動値。
-	-- etype.SpawnYが無ければ呼び出し側が渡したYをそのまま使う
-	local y = etype.SpawnY or position.Y
+	-- 固定MAPのEnemySpawn markerから来る新規spawnは、そのワールドYを地面として使う。
+	-- パトカー降車等、markerを直接使わない既存経路は従来のSpawnYを維持する。
+	local alignToGround = options and options.alignToGround == true
+	local y = if alignToGround then position.Y else etype.SpawnY or position.Y
 	local rootCf = CFrame.new(position.X, y, position.Z)
 
 	-- core: 本体の代表パーツ(人型ならTorso、パトカーならChassis等)。
 	-- markerAnchor: 頭上マーカーの取り付け先(人型ならHead、パトカーならCabin等)
+	local model
 	local core, markerAnchor
 	if etype.Body == "car" then
+		model = Instance.new("Model")
+		model.Name = etype.DisplayName
 		core, markerAnchor = buildCarBody(model, rootCf, etype)
+	elseif etype.Body == "rig" then
+		local template = getRigTemplate(etype.RigTemplate)
+		if not template then
+			return nil -- 旧軽量Bodyにはフォールバックしない
+		end
+		model = template:Clone()
+		model.Name = etype.DisplayName
+		core = model:FindFirstChild("HumanoidRootPart", true)
+		markerAnchor = model:FindFirstChild("Head", true)
+		if not core or not core:IsA("BasePart") or not markerAnchor or not markerAnchor:IsA("BasePart") then
+			warnRigTemplateIssue(etype.RigTemplate, "Clone後に HumanoidRootPart または Head を取得できません")
+			model:Destroy()
+			return nil
+		end
+		model.PrimaryPart = core
+		model:PivotTo(rootCf)
+		prepareRigForCustomMovement(model, core)
+	elseif etype.Body == "model" then
+		local template = getModelTemplate(etype.ModelTemplate)
+		if not template then
+			return nil -- 汎用Modelもコード生成Bodyへフォールバックしない
+		end
+		model = template:Clone()
+		model.Name = etype.DisplayName
+		core, markerAnchor = prepareGenericModel(model, etype.ModelTemplate)
+		if not core then
+			model:Destroy()
+			return nil
+		end
+		local yaw = math.rad(etype.ModelYawOffset or 0)
+		model:PivotTo(rootCf * CFrame.Angles(0, yaw, 0))
 	else -- "human"(Bodyの妥当性は上でチェック済み)
+		model = Instance.new("Model")
+		model.Name = etype.DisplayName
 		core, markerAnchor = buildHumanBody(model, rootCf, etype)
+	end
+	model.PrimaryPart = core
+	local groundY = position.Y
+	if alignToGround then
+		groundY = findGroundSurfaceY(position) or position.Y
+		alignModelFeetToGround(model, groundY)
+		y = core.Position.Y
+	end
+	local hitbox = nil
+	if etype.UseModelHitbox then
+		hitbox = createModelHitbox(model)
 	end
 	local marker = createMarker(markerAnchor)
 
 	-- 全パーツをcoreに溶接(ラグドール化のときに一部を壊す)
-	for _, part in model:GetChildren() do
-		if part ~= core and part:IsA("BasePart") then
-			local weld = Instance.new("WeldConstraint")
-			weld.Part0 = core
-			weld.Part1 = part
-			weld.Parent = core
+	if etype.Body ~= "rig" and etype.Body ~= "model" then
+		for _, part in model:GetChildren() do
+			if part ~= core and part:IsA("BasePart") then
+				local weld = Instance.new("WeldConstraint")
+				weld.Part0 = core
+				weld.Part1 = part
+				weld.Parent = core
+			end
 		end
 	end
 
-	model.PrimaryPart = core
 	model:SetAttribute("EnemyType", typeName)
 	model:SetAttribute("Dead", false)
 	-- SquadId/Retreating(Step5-0)はデバッグとクライアント読み取り用の属性。
@@ -294,6 +668,7 @@ local function spawnEnemy(typeName, position, squadId, options)
 	local enemy = {
 		model = model,
 		core = core,
+		hitbox = hitbox,
 		markerAnchor = markerAnchor,
 		marker = marker,
 		typeName = typeName,
@@ -305,9 +680,14 @@ local function spawnEnemy(typeName, position, squadId, options)
 		lastHitAt = 0,
 		-- 初期値にばらつきを入れる: 同編成が同時発砲すると無敵時間で無駄弾が出て演出も団子になる
 		nextAttack = os.clock() + rng:NextNumber(0, etype.AttackInterval),
+		nextBuildingAttack = os.clock() + (etype.ShellInterval or 0),
 		nextThink = 0,
 		target = nil,
-		spawnY = y, -- etype.SpawnYで上書き済みのY(§修正2)。updateEnemyの接地高さ固定に使う
+		spawnY = y, -- marker由来またはetype.SpawnYの最終Y。updateEnemyの接地高さ固定に使う
+		standingY = y, -- 停止中に維持する個体固有のcore Y。屋上Sniper/降下Soldierも共通
+		-- RoadNodeは道路表面座標なので、車両Rootと接地面の差だけを移動時に加える。
+		groundOffsetY = if alignToGround then y - groundY else 0,
+		sniperSpawnName = options and options.sniperSpawnName or nil,
 		-- 降車ロジック(手順5)用。Body/Movementで分岐させず全タイプに持たせる(非対象タイプでは無害に未使用のまま)
 		spawnedAt = os.clock(),
 		tripsUsed = 0,
@@ -315,6 +695,8 @@ local function spawnEnemy(typeName, position, squadId, options)
 		-- ヘリ降下(Step5-1)用。非対象タイプでは無害にfalseのまま
 		deploying = false,
 		bursting = false,
+		isRig = etype.Body == "rig",
+		isModel = etype.Body == "model",
 	}
 
 	-- ヘリ降下中の個体(Step5-1)。移動・標的選択・攻撃・被弾・頭上「!」をすべて無効化してから登録する
@@ -323,9 +705,13 @@ local function spawnEnemy(typeName, position, squadId, options)
 		local startY = options.deployFromY or y
 		model:PivotTo(CFrame.new(position.X, startY, position.Z))
 		model:SetAttribute("Deploying", true)
-		for _, part in model:GetChildren() do
-			if part:IsA("BasePart") then
-				part.CanQuery = false
+		if enemy.isRig then
+			setRigQueryEnabled(model, false)
+		else
+			for _, part in model:GetChildren() do
+				if part:IsA("BasePart") then
+					part.CanQuery = false
+				end
 			end
 		end
 		marker.Enabled = false
@@ -364,10 +750,10 @@ local function pickTarget(enemy)
 	return best
 end
 
--- fromPos→toPosの直線上に workspace.Map が挟まっていればRaycastResultを返す(無ければnil)。
+-- fromPos→toPosの直線上に現在のMapContext.mapが挟まっていればRaycastResultを返す(無ければnil)。
 -- isBlocked(警官の既存LOS判定)とresolveBurstShot(兵士の曳光弾終点)の両方がこれを使う
 local function raycastMap(fromPos, toPos)
-	local map = workspace:FindFirstChild("Map")
+	local map = currentMap
 	if not map then
 		return nil
 	end
@@ -603,6 +989,127 @@ local function fireSniper(enemy, targetPlayer, targetRoot)
 	end)
 end
 
+--------------------------------------------------------------------
+-- 戦車砲(AttackType=="shell")。照準開始時の着弾点を固定し、予告後に半径判定する。
+--------------------------------------------------------------------
+local function resolveTankShell(enemy, targetPlayer, impactPosition, token)
+	if roundToken ~= token or not aggressive or not enemy.alive then
+		return
+	end
+	if enemy.model:GetAttribute("Retreating") or not targetPlayer.Parent then
+		return
+	end
+
+	local char = targetPlayer.Character
+	local root = char and char:FindFirstChild("HumanoidRootPart")
+	if not root then
+		return
+	end
+
+	local current = root.Position
+	local horizontal = Vector3.new(current.X - impactPosition.X, 0, current.Z - impactPosition.Z).Magnitude
+	if horizontal <= enemy.etype.ShellRadius then
+		damagePlayer(targetPlayer, enemy.etype.TimePenalty, impactPosition)
+	end
+	-- 命中・回避に関係なく固定着弾点で爆発演出を出す。建物破壊APIは呼ばない。
+	deps.effectRemote:FireAllClients("explosion", {
+		position = impactPosition,
+		radius = enemy.etype.ShellRadius,
+	})
+end
+
+local function fireTankShell(enemy, targetPlayer, targetRoot)
+	local etype = enemy.etype
+	local impactPosition = targetRoot.Position
+	local token = roundToken
+	deps.effectRemote:FireAllClients("enemyAim", {
+		from = enemy.markerAnchor.Position,
+		to = impactPosition,
+		duration = etype.Telegraph,
+	})
+	task.delay(etype.Telegraph, function()
+		resolveTankShell(enemy, targetPlayer, impactPosition, token)
+	end)
+end
+
+local function attackBuildingWithShell(enemy, now)
+	local etype = enemy.etype
+	if not etype.DestroysBuildings or not deps.explode or not currentMap then
+		return
+	end
+	if now < enemy.nextBuildingAttack then
+		return
+	end
+	enemy.nextBuildingAttack = now + etype.ShellInterval
+
+	local params = OverlapParams.new()
+	params.FilterType = Enum.RaycastFilterType.Include
+	params.FilterDescendantsInstances = { currentMap }
+	params.MaxParts = 50
+
+	local closest, closestDistance = nil, math.huge
+	for _, part in workspace:GetPartBoundsInRadius(enemy.core.Position, etype.BuildingScanRadius, params) do
+		if part:IsA("BasePart")
+			and CollectionService:HasTag(part, "Destructible")
+			and part:GetAttribute("BuildingId") ~= nil then
+			local distance = (part.Position - enemy.core.Position).Magnitude
+			if distance < closestDistance then
+				closest = part
+				closestDistance = distance
+			end
+		end
+	end
+
+	if closest then
+		deps.explode({
+			position = closest.Position,
+			radius = etype.ShellRadius,
+			attacker = nil,
+			source = "EnemyTank",
+			bonusPolicy = "contribution",
+			sourceEnemyModel = enemy.model,
+		})
+	end
+end
+
+local function updateRoadCombat(enemy, now)
+	local etype = enemy.etype
+	attackBuildingWithShell(enemy, now)
+	if etype.AttackType ~= "shell" or now < enemy.nextAttack then
+		return
+	end
+
+	local target = pickTarget(enemy)
+	local root = target and target.Character and target.Character:FindFirstChild("HumanoidRootPart")
+	if not (target and root) then
+		return
+	end
+	local offset = root.Position - enemy.core.Position
+	local horizontal = Vector3.new(offset.X, 0, offset.Z).Magnitude
+	if horizontal <= etype.AttackRange then
+		enemy.nextAttack = now + etype.AttackInterval
+		fireTankShell(enemy, target, root)
+	end
+end
+
+local function enemyFacingCFrame(enemy, position, direction)
+	local base = CFrame.lookAt(position, position + direction)
+	return base * CFrame.Angles(0, math.rad(enemy.etype.ModelYawOffset or 0), 0)
+end
+
+local function getEnemyFacing(enemy)
+	local cf = enemy.model:GetPivot() * CFrame.Angles(0, math.rad(-(enemy.etype.ModelYawOffset or 0)), 0)
+	return cf.LookVector
+end
+
+local function maintainStandingY(enemy)
+	local currentY = enemy.core.Position.Y
+	local deltaY = enemy.standingY - currentY
+	if math.abs(deltaY) > 1e-4 then
+		enemy.model:PivotTo(enemy.model:GetPivot() + Vector3.new(0, deltaY, 0))
+	end
+end
+
 -- Movement=="direct"(直進)の敵の移動・攻撃。既存ロジックは無変更(リネームのみ)
 local function updateDirectEnemy(enemy, dt)
 	local now = os.clock()
@@ -614,6 +1121,7 @@ local function updateDirectEnemy(enemy, dt)
 	local target = enemy.target
 	local root = target and target.Character and target.Character:FindFirstChild("HumanoidRootPart")
 	if not (target and root) then
+		maintainStandingY(enemy)
 		return -- 標的が居ない: 待機(エラーを出さない)
 	end
 
@@ -627,10 +1135,14 @@ local function updateDirectEnemy(enemy, dt)
 	if d > etype.StopDistance then
 		local speed = if d > etype.AttackRange then etype.ApproachSpeed else etype.MoveSpeed
 		local newPos = pos + dir * speed * dt
-		newPos = Vector3.new(newPos.X, enemy.spawnY, newPos.Z) -- Yは湧いた時点の接地高さに固定
+		local groundY = findGroundSurfaceY(newPos)
+		local moveY = if groundY then groundY + enemy.groundOffsetY else enemy.spawnY
+		newPos = Vector3.new(newPos.X, moveY, newPos.Z)
+		enemy.standingY = moveY -- 停止時も最後に踏んでいた地面へ戻す
 		enemy.model:PivotTo(CFrame.lookAt(newPos, newPos + dir))
 	else
-		enemy.model:PivotTo(CFrame.lookAt(pos, pos + dir)) -- 停止して向きだけ標的に合わせる
+		local groundedPos = Vector3.new(pos.X, enemy.standingY, pos.Z)
+		enemy.model:PivotTo(CFrame.lookAt(groundedPos, groundedPos + dir)) -- XZは固定し、接地Yだけ戻す
 	end
 
 	if now >= enemy.nextAttack and d <= etype.AttackRange then
@@ -657,6 +1169,7 @@ local function updateStationaryEnemy(enemy, _dt)
 	local target = enemy.target
 	local root = target and target.Character and target.Character:FindFirstChild("HumanoidRootPart")
 	if not (target and root) then
+		maintainStandingY(enemy)
 		return -- 標的が居ない: 待機(エラーを出さない)
 	end
 
@@ -664,6 +1177,14 @@ local function updateStationaryEnemy(enemy, _dt)
 	local flatOffset = Vector3.new(
 		root.Position.X - enemy.core.Position.X, 0, root.Position.Z - enemy.core.Position.Z)
 	local d = flatOffset.Magnitude
+	if d > 0.01 then
+		-- SniperSpawnのRotationは使わず、接地位置を維持したまま標的方向へYawだけ合わせる。
+		local pos = enemy.core.Position
+		local groundedPos = Vector3.new(pos.X, enemy.standingY, pos.Z)
+		enemy.model:PivotTo(CFrame.lookAt(groundedPos, groundedPos + flatOffset.Unit))
+	else
+		maintainStandingY(enemy)
+	end
 
 	if now >= enemy.nextAttack and d <= etype.AttackRange then
 		-- nextAttackは攻撃"開始"時点でここに積む(updateDirectEnemyと同じ意味)
@@ -682,16 +1203,21 @@ end
 local function updateDeployingEnemy(enemy, dt)
 	local cfg = Config.Threat.HelicopterTransport
 	local pos = enemy.core.Position
-	local targetY = enemy.spawnY -- 最終接地Y(etype.SpawnY)。updateDirectEnemyと同じ値を使う
+	local targetY = enemy.spawnY -- marker由来またはetype.SpawnYの最終接地Y
 	local newY = pos.Y - cfg.DescendSpeed * dt
 
 	if newY <= targetY then
 		enemy.model:PivotTo(CFrame.new(pos.X, targetY, pos.Z))
+		enemy.standingY = targetY -- 降下後Soldier固有の着地Yを以降の停止接地へ引き継ぐ
 		enemy.deploying = false
 		enemy.model:SetAttribute("Deploying", false)
-		for _, part in enemy.model:GetChildren() do
-			if part:IsA("BasePart") then
-				part.CanQuery = true
+		if enemy.isRig then
+			setRigQueryEnabled(enemy.model, true)
+		else
+			for _, part in enemy.model:GetChildren() do
+				if part:IsA("BasePart") then
+					part.CanQuery = true
+				end
 			end
 		end
 		if enemy.marker then
@@ -707,83 +1233,72 @@ local function updateDeployingEnemy(enemy, dt)
 end
 
 --------------------------------------------------------------------
--- 道路走行(Movement=="road")のヘルパー。§3-1〜§3-5
+-- 道路走行(Movement=="road")のヘルパー
 --------------------------------------------------------------------
--- vに最も近い道路中心線の値を返す
-local function nearestLine(v)
-	local best, bestDist = savedRoadLines[1], math.huge
-	for _, line in savedRoadLines do
-		local d = math.abs(line - v)
-		if d < bestDist then
-			bestDist = d
-			best = line
+-- 高低差より道路の横方向を優先するため、最寄り判定はXZ平方距離で行う。
+-- 同距離の場合はノード名順で決定し、実行ごとの揺れを防ぐ。
+local function findNearestRoadNode(network, position)
+	local best = nil
+	local bestDistanceSq = math.huge
+	for _, node in network.nodes do
+		local dx = node.position.X - position.X
+		local dz = node.position.Z - position.Z
+		local distanceSq = dx * dx + dz * dz
+		if distanceSq < bestDistanceSq
+			or (distanceSq == bestDistanceSq and (not best or node.name < best.name)) then
+			best = node
+			bestDistanceSq = distanceSq
 		end
 	end
 	return best
 end
 
--- 街の範囲(±cityBounds)にクランプする
-local function clampToCity(v)
-	return math.clamp(v, -cityBounds, cityBounds)
-end
-
--- 目的地(プレイヤー位置を道路中心線へ投影した点)を求める。§3-2(ユーザー決定):
--- 最寄り交差点ではなく、縦道路上・横道路上それぞれへの投影のうち近い方を選ぶ。
--- 戻り値: 目的地の座標, 縦道路上かどうか
-local function computeTargetPoint(playerPos, y)
-	local px, pz = playerPos.X, playerPos.Z
-	local vx, hz = nearestLine(px), nearestLine(pz)
-	local cx, cz = clampToCity(px), clampToCity(pz)
-	local candidateA = Vector3.new(vx, y, cz) -- 縦道路上
-	local candidateB = Vector3.new(cx, y, hz) -- 横道路上
-	local distA = (Vector3.new(vx, 0, cz) - Vector3.new(px, 0, pz)).Magnitude
-	local distB = (Vector3.new(cx, 0, hz) - Vector3.new(px, 0, pz)).Magnitude
-	if distA <= distB then
-		return candidateA, true
+-- neighborsはMapRuntimeで名前順に固定済み。通常のBFSで最短ホップ経路を復元する。
+local function findRoadPath(network, startNodeName, goalNodeName)
+	if not network.nodes[startNodeName] or not network.nodes[goalNodeName] then
+		return nil
 	end
-	return candidateB, false
+	if startNodeName == goalNodeName then
+		return { startNodeName }
+	end
+
+	local queue = { startNodeName }
+	local queueIndex = 1
+	local visited = { [startNodeName] = true }
+	local parent = {}
+
+	while queueIndex <= #queue do
+		local nodeName = queue[queueIndex]
+		queueIndex += 1
+		for _, neighborName in network.nodes[nodeName].neighbors do
+			if not visited[neighborName] then
+				visited[neighborName] = true
+				parent[neighborName] = nodeName
+				if neighborName == goalNodeName then
+					local path = { goalNodeName }
+					local current = goalNodeName
+					while current ~= startNodeName do
+						current = parent[current]
+						table.insert(path, 1, current)
+					end
+					return path
+				end
+				table.insert(queue, neighborName)
+			end
+		end
+	end
+
+	return nil
 end
 
--- マンハッタン経路を構築する(最大3レグ。centerline上の座標のみで、車線オフセットは含まない)。§3-4。
--- 各要素は { point, axis, line }。axisは「その地点に到達後、車がどちらの道路に乗っている
--- ことになるか」を表し、次のretarget時にbuildRouteの起点として使う
-local function buildRoute(roadAxis, roadLine, target, targetIsVertical)
+local function buildRoadWaypoints(network, path, groundOffsetY)
 	local waypoints = {}
-	local targetAxis = if targetIsVertical then "vertical" else "horizontal"
-	local targetLine = if targetIsVertical then target.X else target.Z
-
-	if roadAxis == "vertical" then
-		local cx = roadLine
-		if targetIsVertical then
-			local tx = target.X
-			if math.abs(cx - tx) < 0.5 then
-				table.insert(waypoints, { point = target, axis = targetAxis, line = targetLine })
-			else
-				local zc = nearestLine(target.Z)
-				table.insert(waypoints, { point = Vector3.new(cx, target.Y, zc), axis = "horizontal", line = zc })
-				table.insert(waypoints, { point = Vector3.new(tx, target.Y, zc), axis = "vertical", line = tx })
-				table.insert(waypoints, { point = target, axis = targetAxis, line = targetLine })
-			end
-		else
-			table.insert(waypoints, { point = Vector3.new(cx, target.Y, target.Z), axis = "horizontal", line = target.Z })
-			table.insert(waypoints, { point = target, axis = targetAxis, line = targetLine })
-		end
-	else -- "horizontal"
-		local cz = roadLine
-		if not targetIsVertical then
-			local tz = target.Z
-			if math.abs(cz - tz) < 0.5 then
-				table.insert(waypoints, { point = target, axis = targetAxis, line = targetLine })
-			else
-				local xc = nearestLine(target.X)
-				table.insert(waypoints, { point = Vector3.new(xc, target.Y, cz), axis = "vertical", line = xc })
-				table.insert(waypoints, { point = Vector3.new(xc, target.Y, tz), axis = "horizontal", line = tz })
-				table.insert(waypoints, { point = target, axis = targetAxis, line = targetLine })
-			end
-		else
-			table.insert(waypoints, { point = Vector3.new(target.X, target.Y, cz), axis = "vertical", line = target.X })
-			table.insert(waypoints, { point = target, axis = targetAxis, line = targetLine })
-		end
+	for _, nodeName in path do
+		local node = network.nodes[nodeName]
+		table.insert(waypoints, {
+			name = nodeName,
+			point = node.position + Vector3.new(0, groundOffsetY, 0),
+		})
 	end
 	return waypoints
 end
@@ -793,11 +1308,14 @@ end
 local function computeLegDriveTarget(legStart, legEnd, laneOffset)
 	local flatStart = Vector3.new(legStart.X, 0, legStart.Z)
 	local flatEnd = Vector3.new(legEnd.X, 0, legEnd.Z)
-	local legVec = flatEnd - flatStart
-	local legDir = if legVec.Magnitude > 0.01 then legVec.Unit else Vector3.new(0, 0, 1)
-	local leftVec = Vector3.new(legDir.Z, 0, -legDir.X)
+	local flatLegVec = flatEnd - flatStart
+	local flatLegDir = if flatLegVec.Magnitude > 0.01 then flatLegVec.Unit else Vector3.new(0, 0, 1)
+	local leftVec = Vector3.new(flatLegDir.Z, 0, -flatLegDir.X)
 	local laneShift = leftVec * laneOffset
-	return flatEnd + laneShift, legDir
+	local driveTarget = legEnd + laneShift
+	local legVec = driveTarget - legStart
+	local legDir = if legVec.Magnitude > 0.01 then legVec.Unit else flatLegDir
+	return driveTarget, legDir
 end
 
 -- 現在のレグ(enemy.wpIndex)のdriveTarget/legDirを計算し直す
@@ -806,23 +1324,13 @@ local function startLeg(enemy, legStartPoint)
 	enemy.driveTarget, enemy.legDir = computeLegDriveTarget(legStartPoint, wp.point, enemy.etype.LaneOffset)
 end
 
--- 経路構築後、直前の点(車の現在位置、または前のウェイポイント)からWaypointRadius未満しか
--- 離れていない中間ウェイポイントを取り除く。車は交差点に湧くため経路の1本目がほぼゼロ長になる
--- ケースがあり、そのまま使うと(E-S).Unitが不定になって車線オフセットの点を周回してしまう。
--- 最終ウェイポイント(targetPoint)は距離に関わらず必ず残す(目的地そのものなので)
-local function pruneShortLegs(waypoints, startPos, waypointRadius)
-	local pruned = {}
-	local prevPoint = Vector3.new(startPos.X, 0, startPos.Z)
-	for i, wp in waypoints do
-		local isLast = (i == #waypoints)
-		local flatPoint = Vector3.new(wp.point.X, 0, wp.point.Z)
-		local dist = (flatPoint - prevPoint).Magnitude
-		if isLast or dist >= waypointRadius then
-			table.insert(pruned, wp)
-			prevPoint = flatPoint
-		end
+-- 経路先頭は「現在位置の最寄りノード」なので、既に到着半径内なら省略できる。
+-- 2番目以降は短区間や同一XZの高低差も道路形状の一部であり、勝手に間引かない。
+local function pruneReachedStartNode(waypoints, startPos, waypointRadius)
+	if #waypoints > 1 and (waypoints[1].point - startPos).Magnitude < waypointRadius then
+		table.remove(waypoints, 1)
 	end
-	return pruned
+	return waypoints
 end
 
 --------------------------------------------------------------------
@@ -830,7 +1338,7 @@ end
 --------------------------------------------------------------------
 
 -- 車の左右のドア横に警官を降ろす。円周ランダムにはしない(車体にめり込むため)。
--- Y座標はここで計算しない: spawnEnemy側がetype.SpawnYで上書きするので車のYをそのまま渡してよい
+-- Phase 2-2では降車位置はmarker直接spawnではないため、従来どおりspawnEnemy側のetype.SpawnYを使う
 local function deployFromCar(enemy, isFallback)
 	local cfg = enemy.etype
 	local cf = enemy.model:GetPivot()
@@ -889,55 +1397,78 @@ local function checkDeploy(enemy)
 	end
 end
 
--- Movement=="road"(道路網走行)の敵の移動。パトカーは攻撃しないため発砲判定は行わない
+-- Movement=="road"(道路網走行)の敵。移動は共有し、戦闘だけAttackTypeで分岐する。
 local function updateRoadEnemy(enemy, dt)
 	checkDeploy(enemy) -- 到着判定(enemy.arrived)は1フレーム遅れうるが許容範囲
 	local etype = enemy.etype
 	local now = os.clock()
+	updateRoadCombat(enemy, now)
+	if not roadNetwork then
+		if not roadNavigationWarned then
+			roadNavigationWarned = true
+			warn("[EnemyManager] MapContext.roadNetworkが無いため道路走行敵の移動を停止します")
+		end
+		return
+	end
 
-	-- 初回呼び出し時の初期化(湧いた地点は交差点なので縦道路にいるものとして扱う。§3-4末尾)
-	if not enemy.roadAxis then
-		enemy.roadAxis = "vertical"
-		enemy.roadLine = nearestLine(enemy.core.Position.X)
+	if not enemy.roadInitialized then
+		enemy.roadInitialized = true
 		enemy.waypoints = nil
 		enemy.wpIndex = 1
 		enemy.arrived = false
-		enemy.facing = enemy.model.PrimaryPart.CFrame.LookVector
+		enemy.facing = getEnemyFacing(enemy)
 		enemy.nextRetarget = 0 -- 即座に最初の目的地を計算させる
 	end
 
-	-- §3-3: 目的地の追尾とヒステリシス。RetargetIntervalごとにのみ再評価する
+	-- 目的地の追尾とヒステリシス。RetargetIntervalごとにのみ再評価する。
 	if now >= enemy.nextRetarget then
 		enemy.nextRetarget = now + etype.RetargetInterval
 		local player = pickTarget(enemy)
 		local root = player and player.Character and player.Character:FindFirstChild("HumanoidRootPart")
 		if root then
-			local newTarget, newIsVertical = computeTargetPoint(root.Position, enemy.spawnY)
+			local startNode = findNearestRoadNode(roadNetwork, enemy.core.Position)
+			local goalNode = findNearestRoadNode(roadNetwork, root.Position)
 			local flatPlayer = Vector3.new(root.Position.X, 0, root.Position.Z)
-			local shouldSwitch = not enemy.targetPoint
-			if enemy.targetPoint then
+			local shouldSwitch = startNode ~= nil and goalNode ~= nil and not enemy.targetNodeName
+			if startNode and goalNode and enemy.targetNodeName then
 				-- 新しい目的地が現在の目的地よりRetargetThreshold以上プレイヤーに近い場合のみ切り替える
-				-- (これが無いと、プレイヤーが道路の継ぎ目付近をうろつくだけで目的地が細かく
+				-- (これが無いと、プレイヤーがRoadNodeの境界付近をうろつくだけで目的地が細かく
 				-- 前後して停車位置が定まらない)
-				local curDist = (Vector3.new(enemy.targetPoint.X, 0, enemy.targetPoint.Z) - flatPlayer).Magnitude
-				local newDist = (Vector3.new(newTarget.X, 0, newTarget.Z) - flatPlayer).Magnitude
-				shouldSwitch = (curDist - newDist) >= etype.RetargetThreshold
+				local currentTargetNode = roadNetwork.nodes[enemy.targetNodeName]
+				if currentTargetNode then
+					local currentFlat = Vector3.new(currentTargetNode.position.X, 0, currentTargetNode.position.Z)
+					local goalFlat = Vector3.new(goalNode.position.X, 0, goalNode.position.Z)
+					local currentDistance = (currentFlat - flatPlayer).Magnitude
+					local newDistance = (goalFlat - flatPlayer).Magnitude
+					shouldSwitch = goalNode.name ~= enemy.targetNodeName
+						and (currentDistance - newDistance) >= etype.RetargetThreshold
+				else
+					shouldSwitch = true
+				end
 			end
-			if shouldSwitch then
-				enemy.targetPoint = newTarget
-				enemy.targetIsVertical = newIsVertical
-				local route = buildRoute(enemy.roadAxis, enemy.roadLine, newTarget, newIsVertical)
-				enemy.waypoints = pruneShortLegs(route, enemy.core.Position, etype.WaypointRadius)
-				enemy.wpIndex = 1
-				enemy.arrived = false
-				startLeg(enemy, enemy.core.Position)
+			if shouldSwitch and startNode and goalNode then
+				local path = findRoadPath(roadNetwork, startNode.name, goalNode.name)
+				if path then
+					enemy.targetNodeName = goalNode.name
+					enemy.targetPoint = goalNode.position + Vector3.new(0, enemy.groundOffsetY, 0)
+					local route = buildRoadWaypoints(roadNetwork, path, enemy.groundOffsetY)
+					enemy.waypoints = pruneReachedStartNode(route, enemy.core.Position, etype.WaypointRadius)
+					enemy.wpIndex = 1
+					enemy.arrived = false
+					enemy.roadStandingY = nil -- 新経路の到着時に、その場の正しいYを取り直す
+					enemy.unreachableRouteKey = nil
+					startLeg(enemy, enemy.core.Position)
 
-				if Config.Threat.DebugLog then
-					local parts = {}
-					for _, wp in enemy.waypoints do
-						table.insert(parts, ("(%.0f,%.0f)"):format(wp.point.X, wp.point.Z))
+					if Config.Threat.DebugLog then
+						print(("[EnemyManager] road route: %s"):format(table.concat(path, " -> ")))
 					end
-					print(("[EnemyManager] route: %s"):format(table.concat(parts, " -> ")))
+				else
+					local routeKey = startNode.name .. "->" .. goalNode.name
+					if enemy.unreachableRouteKey ~= routeKey then
+						enemy.unreachableRouteKey = routeKey
+						warn(("[EnemyManager] RoadNode経路が到達不能です (%s)。今回の経路更新をスキップします")
+							:format(routeKey))
+					end
 				end
 			end
 		end
@@ -948,16 +1479,19 @@ local function updateRoadEnemy(enemy, dt)
 	end
 
 	local pos = enemy.core.Position
-	local flatPos = Vector3.new(pos.X, 0, pos.Z)
 	local isFinalLeg = enemy.wpIndex >= #enemy.waypoints
 
 	if isFinalLeg then
 		-- 最終ウェイポイント(=targetPoint)への到着判定は、車線オフセット込みのdriveTargetではなく
 		-- 素のtargetPointとの距離で行う(StopDistanceは「目的地にどれだけ近いか」の指標のため)。
 		-- こちらは「通り過ぎたか」判定を適用しない(追尾中に通り過ぎたと誤判定させないため)
-		local flatTarget = Vector3.new(enemy.targetPoint.X, 0, enemy.targetPoint.Z)
-		enemy.arrived = (flatTarget - flatPos).Magnitude <= etype.StopDistance
+		enemy.arrived = (enemy.targetPoint - pos).Magnitude <= etype.StopDistance
 		if enemy.arrived then
+			-- 到着した瞬間の移動中Yを正しい停止Yとして固定する。車種ごとの高さは
+			-- spawn時のgroundOffsetYと経路補間に既に反映済みなので固定数値を使わない。
+			enemy.roadStandingY = enemy.roadStandingY or pos.Y
+			enemy.standingY = enemy.roadStandingY
+			maintainStandingY(enemy)
 			return -- 到着済み: 停車(検問所のようにその場に留まる。§3-3)
 		end
 	else
@@ -968,19 +1502,18 @@ local function updateRoadEnemy(enemy, dt)
 		-- ウェイポイントはレグごとに向きが変わるため毎回異なる方向にLaneOffset分ずれる。
 		-- この結果、車の走行線とウェイポイントは常にLaneOffset相当(数stud)離れたままになり、
 		-- 距離だけで「到着」を判定する方式では原理的に到達できない(2026-08 実機診断で確定)
-		local toE = enemy.driveTarget - flatPos
+		local toE = enemy.driveTarget - pos
 		local passed = toE:Dot(enemy.legDir) <= 0 -- Eを通り過ぎた
 		local close = toE.Magnitude < etype.WaypointRadius
 		if passed or close then
 			local reached = enemy.waypoints[enemy.wpIndex]
-			enemy.roadAxis, enemy.roadLine = reached.axis, reached.line
 			enemy.wpIndex += 1
 			startLeg(enemy, reached.point)
 			return -- このフレームの移動はここまで。次フレームで新しいレグを進む
 		end
 	end
 
-	local toTarget = enemy.driveTarget - flatPos
+	local toTarget = enemy.driveTarget - pos
 	local dist = toTarget.Magnitude
 	local dir = if dist > 0.01 then toTarget.Unit else enemy.legDir
 
@@ -991,10 +1524,11 @@ local function updateRoadEnemy(enemy, dt)
 		enemy.facing = blended.Unit
 	end
 
-	local newFlatPos = flatPos + enemy.facing * etype.MoveSpeed * dt
-	local newPos = Vector3.new(newFlatPos.X, enemy.spawnY, newFlatPos.Z)
+	-- 3D方向へ進めることで、RoadNode間のYもXZと同時に補間する。
+	local step = math.min(etype.MoveSpeed * dt, dist)
+	local newPos = pos + enemy.facing * step
 	-- Roblox標準どおり-Zを正面として扱う(人型と同じ式)。§4でAxleFrontを-Z側に置いたため一致する
-	enemy.model:PivotTo(CFrame.lookAt(newPos, newPos + enemy.facing))
+	enemy.model:PivotTo(enemyFacingCFrame(enemy, newPos, enemy.facing))
 end
 
 local function updateEnemy(enemy, dt)
@@ -1014,14 +1548,14 @@ end
 -- aggressiveに関係なく毎フレーム呼ぶ(下記Heartbeat参照)
 --------------------------------------------------------------------
 
--- 撤退方向。現在位置から街の4辺(+X/-X/+Z/-Z、cityBounds基準)のうち
+-- 撤退方向。現在位置から固定MAP boundsの4辺(+X/-X/+Z/-Z)のうち
 -- 最も近い方向を選び、単位ベクトルを返す
 local function computeRetreatDirection(pos)
 	local candidates = {
-		{ dist = cityBounds - pos.X, dir = Vector3.new(1, 0, 0) },
-		{ dist = pos.X + cityBounds, dir = Vector3.new(-1, 0, 0) },
-		{ dist = cityBounds - pos.Z, dir = Vector3.new(0, 0, 1) },
-		{ dist = pos.Z + cityBounds, dir = Vector3.new(0, 0, -1) },
+		{ dist = mapBounds.maxX - pos.X, dir = Vector3.new(1, 0, 0) },
+		{ dist = pos.X - mapBounds.minX, dir = Vector3.new(-1, 0, 0) },
+		{ dist = mapBounds.maxZ - pos.Z, dir = Vector3.new(0, 0, 1) },
+		{ dist = pos.Z - mapBounds.minZ, dir = Vector3.new(0, 0, -1) },
 	}
 	local best = candidates[1]
 	for _, c in candidates do
@@ -1037,13 +1571,11 @@ end
 -- Tween/task.delayを1回しか作らないことがこの前提で保証される(二重生成防止)
 local function startFallbackFade(model)
 	local token = roundToken
-	for _, part in model:GetChildren() do
-		if part:IsA("BasePart") then
+	forEachModelBasePart(model, function(part)
 			TweenService:Create(part,
 				TweenInfo.new(Config.Threat.Retreat.FallbackFadeTime, Enum.EasingStyle.Linear, Enum.EasingDirection.Out),
 				{ Transparency = 1 }):Play()
-		end
-	end
+	end)
 	task.delay(Config.Threat.Retreat.FallbackFadeTime, function()
 		if roundToken ~= token then
 			return
@@ -1055,7 +1587,7 @@ local function startFallbackFade(model)
 end
 
 -- 撤退中の地上個体を毎フレーム更新する。MaxDuration超過はstartFallbackFadeへ切替、
--- cityBounds+ExitMarginを超えたら即Destroyする。いずれの分岐も、後続処理より先に
+-- boundsをExitMarginぶん越えたら即Destroyする。いずれの分岐も、後続処理より先に
 -- retreatingEnemies[model]=nilする(同じモデルが次フレーム以降も再処理されるのを防ぐ)
 local function updateRetreatingEnemy(model, record, dt)
 	if os.clock() - record.startedAt > Config.Threat.Retreat.MaxDuration then
@@ -1066,10 +1598,18 @@ local function updateRetreatingEnemy(model, record, dt)
 
 	local pos = record.core.Position
 	local newPos = pos + record.dir * Config.Threat.Retreat.Speed * dt
-	model:PivotTo(CFrame.lookAt(newPos, newPos + record.dir))
+	model:PivotTo(CFrame.lookAt(newPos, newPos + record.dir)
+		* CFrame.Angles(0, math.rad(record.modelYawOffset or 0), 0))
+	if record.isRig then
+		record.core.AssemblyLinearVelocity = Vector3.zero
+		record.core.AssemblyAngularVelocity = Vector3.zero
+	end
 
-	local exitBoundary = cityBounds + Config.Threat.Retreat.ExitMargin
-	if math.abs(newPos.X) > exitBoundary or math.abs(newPos.Z) > exitBoundary then
+	local exitMargin = Config.Threat.Retreat.ExitMargin
+	if newPos.X > mapBounds.maxX + exitMargin
+		or newPos.X < mapBounds.minX - exitMargin
+		or newPos.Z > mapBounds.maxZ + exitMargin
+		or newPos.Z < mapBounds.minZ - exitMargin then
 		retreatingEnemies[model] = nil
 		if model.Parent then
 			model:Destroy()
@@ -1078,11 +1618,14 @@ local function updateRetreatingEnemy(model, record, dt)
 end
 
 RunService.Heartbeat:Connect(function(dt)
-	if aggressive then
-		for model, enemy in enemies do
-			if enemy.alive and model.Parent then
-				updateEnemy(enemy, dt)
-			end
+	for model, enemy in enemies do
+		if not model.Parent then
+			-- 外部コード等で直接Destroyされた場合も予約を永久占有させない。
+			releaseSniperSpawn(enemy)
+			enemies[model] = nil
+		elseif aggressive and enemy.alive then
+			stabilizeRig(enemy)
+			updateEnemy(enemy, dt)
 		end
 	end
 	-- 撤退中の地上個体(Step5-2)はaggressiveに関係なく毎フレーム更新する(仕様どおり)。
@@ -1100,43 +1643,66 @@ end)
 -- 撃破処理
 --------------------------------------------------------------------
 local function killEnemy(enemy, ctx)
+	if not enemy.alive then
+		return
+	end
 	enemy.alive = false
+	releaseSniperSpawn(enemy) -- 死体が残る6秒間もSpawn地点は再利用可能
 	enemy.model:SetAttribute("Dead", true)
 	if enemy.marker then
 		enemy.marker.Enabled = false
 	end
-
-	-- ラグドール化(NPCManager.killNpcの手法をコピー): Weldを2〜3個ランダムに破壊
-	local welds = {}
-	for _, w in enemy.core:GetChildren() do
-		if w:IsA("WeldConstraint") then
-			table.insert(welds, w)
-		end
+	if enemy.hitFlash then
+		enemy.hitFlash.Enabled = false
 	end
-	for _ = 1, rng:NextInteger(2, 3) do
-		if #welds > 0 then
-			local w = table.remove(welds, rng:NextInteger(1, #welds))
-			if w then
-				w:Destroy()
+
+	local fadeDuration = 0.65
+	local useFade = enemy.etype.DeathMode == "fade"
+	if useFade then
+		-- 大型Modelは物理化せず、全BasePartを同時にフェードさせる。
+		forEachModelBasePart(enemy.model, function(part)
+			part.Anchored = true
+			part.CanCollide = false
+			part.CanTouch = false
+			part.CanQuery = false
+			TweenService:Create(part,
+				TweenInfo.new(fadeDuration, Enum.EasingStyle.Linear, Enum.EasingDirection.Out),
+				{ Transparency = 1 }):Play()
+		end)
+	elseif enemy.isRig then
+		-- R15のMotor6Dは壊さない。簡易ダウン姿勢にして射撃を遮らない死体として短時間残す。
+		prepareRigCorpse(enemy)
+	else
+		-- ラグドール化(NPCManager.killNpcの手法をコピー): Weldを2〜3個ランダムに破壊
+		local welds = {}
+		for _, w in enemy.core:GetChildren() do
+			if w:IsA("WeldConstraint") then
+				table.insert(welds, w)
 			end
 		end
-	end
+		for _ = 1, rng:NextInteger(2, 3) do
+			if #welds > 0 then
+				local w = table.remove(welds, rng:NextInteger(1, #welds))
+				if w then
+					w:Destroy()
+				end
+			end
+		end
 
-	for _, part in enemy.model:GetChildren() do
-		if part:IsA("BasePart") then
-			part.Anchored = false
-			part.CanCollide = true
-			-- 死体はCanQuery=falseにする。trueのままだと6秒間、バズーカのレイキャストを
-			-- 死体が遮ってしまい、建物を狙った弾が死体で爆発する事故になる
-			part.CanQuery = false
-			part.CollisionGroup = "Debris" -- 既存グループを流用(DestructionManager.Initで登録済み)
-			pcall(function()
-				part:SetNetworkOwner(nil)
-			end)
-			local offset = part.Position - ctx.position
-			local dir = if offset.Magnitude > 0.01 then offset.Unit else Vector3.yAxis
-			dir = (dir + Vector3.new(0, 0.6, 0)).Unit
-			part:ApplyImpulse(dir * part:GetMass() * 60)
+		for _, part in enemy.model:GetChildren() do
+			if part:IsA("BasePart") then
+				part.Anchored = false
+				part.CanCollide = true
+				part.CanQuery = false
+				part.CollisionGroup = "Debris"
+				pcall(function()
+					part:SetNetworkOwner(nil)
+				end)
+				local offset = part.Position - ctx.position
+				local dir = if offset.Magnitude > 0.01 then offset.Unit else Vector3.yAxis
+				dir = (dir + Vector3.new(0, 0.6, 0)).Unit
+				part:ApplyImpulse(dir * part:GetMass() * 60)
+			end
 		end
 	end
 
@@ -1155,6 +1721,9 @@ local function killEnemy(enemy, ctx)
 	end
 
 	deps.effectRemote:FireAllClients("enemyKill", { position = enemy.core.Position })
+	if deps.onEnemyKilled then
+		deps.onEnemyKilled(enemy.squadId, enemy.typeName)
+	end
 
 	if Config.Threat.DebugLog then
 		print(("[EnemyManager] %s を撃破 (squad=%d)"):format(enemy.etype.DisplayName, enemy.squadId))
@@ -1162,7 +1731,8 @@ local function killEnemy(enemy, ctx)
 
 	local model = enemy.model
 	local token = roundToken
-	task.delay(Config.Threat.CorpseDespawnTime, function()
+	local despawnDelay = if useFade then fadeDuration else Config.Threat.CorpseDespawnTime
+	task.delay(despawnDelay, function()
 		if roundToken ~= token then
 			return
 		end
@@ -1176,6 +1746,19 @@ local function killEnemy(enemy, ctx)
 	enemies[model] = nil
 end
 
+-- ワールド座標のpointから、回転したPart箱の内部または表面までの最短距離を返す。
+-- pointが箱の内側なら0。Tankの透明DamageHitbox用であり、PartのCanQueryは参照しない。
+local function pointToBoxDistance(point, box)
+	local localPoint = box.CFrame:PointToObjectSpace(point)
+	local half = box.Size * 0.5
+	local closest = Vector3.new(
+		math.clamp(localPoint.X, -half.X, half.X),
+		math.clamp(localPoint.Y, -half.Y, half.Y),
+		math.clamp(localPoint.Z, -half.Z, half.Z)
+	)
+	return (localPoint - closest).Magnitude
+end
+
 -- DestructionManager.blastListenersから呼ばれる。敵はworkspace.Mapの外に居るため
 -- Explodeのspatial query(GetPartBoundsInRadius)には引っかからない。よって
 -- ここで自前に距離判定する(NPCManager.OnExplosionと同じ構造)
@@ -1184,10 +1767,14 @@ function EnemyManager.OnExplosion(ctx)
 	for model, enemy in enemies do
 		-- 降下中(Step5-1)は爆風の巻き添えも受けない。CanQuery=falseは直撃レイキャストしか
 		-- 防げない(爆風は距離判定のみでCanQueryを見ない)ため、ここでも明示的に除外する
-		if enemy.alive and not enemy.deploying then
-			-- coreの1点判定のみ(車体半長6 < バズーカ半径12なので、パトカーでも実用上問題ない)
-			local dist = (enemy.core.Position - ctx.position).Magnitude
-			if dist <= ctx.radius + 2 then -- マージン2はNPCManager.killNpcの既存値に揃える
+		if enemy.alive and not enemy.deploying and model ~= ctx.sourceEnemyModel then
+			-- Tank等の透明Hitboxはモデル外形までの最短距離、その他は従来どおりcoreの1点判定。
+			local hasHitbox = enemy.hitbox and enemy.hitbox.Parent
+			local dist = if hasHitbox
+				then pointToBoxDistance(ctx.position, enemy.hitbox)
+				else (enemy.core.Position - ctx.position).Magnitude
+			local hitRadius = if hasHitbox then 0 else enemy.etype.HitRadius or 2
+			if dist <= ctx.radius + hitRadius then
 				if now - enemy.lastHitAt >= enemy.etype.HitCooldown then
 					enemy.lastHitAt = now
 					enemy.hp -= 1
@@ -1214,18 +1801,140 @@ end
 --------------------------------------------------------------------
 function EnemyManager.Init(dependencies)
 	deps = dependencies
-	local roadLines = deps.roadLines
-	if not roadLines or #roadLines == 0 then
-		warn("[EnemyManager] CityGenerator.GetRoadLines()がnil/空を返しました"
-			.. "(従来モード等で湧き位置が算出できません)。敵システムを無効化します")
-		systemDisabled = true
+	table.clear(rigTemplates)
+	table.clear(warnedRigTemplateIssues)
+	table.clear(modelTemplates)
+	table.clear(warnedModelTemplateIssues)
+	table.clear(warnedModelFallbacks)
+	for _, etype in Config.Threat.EnemyTypes do
+		if etype.Body == "rig" then
+			findRigTemplate(etype.RigTemplate)
+		elseif etype.Body == "model" then
+			findModelTemplate(etype.ModelTemplate)
+		end
+	end
+end
+
+-- ラウンドごとにMapRuntime.LoadRound()の戻り値を設定する。
+-- MAP構造の探索はMapRuntimeだけが担当し、ここでは検証済みcontextの値だけをコピーして使う。
+function EnemyManager.SetMapContext(context)
+	-- 新しいcontextの検証に失敗しても、前ラウンドのInstance・座標を使い続けない。
+	currentMap = nil
+	mapBounds = nil
+	mapCenter = nil
+	table.clear(spawnPoints)
+	table.clear(sniperSpawnPoints)
+	table.clear(occupiedSniperSpawns)
+	roadNetwork = nil
+	roadNavigationWarned = false
+	systemDisabled = true
+
+	if typeof(context) ~= "table" then
+		warn("[EnemyManager] MapContextが設定されていません。敵システムを無効化します")
 		return
 	end
-	savedRoadLines = roadLines
-	-- gridモードでは最外周の道路中心線 = 街の外周座標。roadLinesは昇順配列
-	-- (CityGenerator.GetRoadLinesがk=0..Nの順で挿入するため)なので末尾が最大値になる
-	cityBounds = roadLines[#roadLines]
-	spawnPoints = computeSpawnPoints(roadLines)
+	if typeof(context.map) ~= "Instance" or not context.map.Parent then
+		warn("[EnemyManager] MapContext.mapが有効なInstanceではありません。敵システムを無効化します")
+		return
+	end
+
+	local bounds = context.bounds
+	local validBounds = typeof(bounds) == "table"
+		and typeof(bounds.minX) == "number"
+		and typeof(bounds.maxX) == "number"
+		and typeof(bounds.minZ) == "number"
+		and typeof(bounds.maxZ) == "number"
+		and bounds.minX <= bounds.maxX
+		and bounds.minZ <= bounds.maxZ
+	if not validBounds then
+		warn("[EnemyManager] MapContext.boundsが不正です。敵システムを無効化します")
+		return
+	end
+
+	local points = context.enemySpawnPoints
+	if typeof(points) ~= "table" then
+		warn("[EnemyManager] MapContext.enemySpawnPointsがありません。敵システムを無効化します")
+		return
+	end
+	for _, point in points do
+		if typeof(point) == "Vector3" then
+			table.insert(spawnPoints, point)
+		else
+			warn("[EnemyManager] MapContext.enemySpawnPointsにVector3以外の値があるため除外します")
+		end
+	end
+	if #spawnPoints == 0 then
+		warn("[EnemyManager] 有効な敵spawn候補が0件です。敵システムを無効化します")
+		return
+	end
+
+	local contextSniperSpawnPoints = context.sniperSpawnPoints
+	if typeof(contextSniperSpawnPoints) ~= "table" then
+		warn("[EnemyManager] MapContext.sniperSpawnPointsが不正です。敵システムを無効化します")
+		return
+	end
+	local seenSniperSpawnNames = {}
+	for _, point in contextSniperSpawnPoints do
+		if typeof(point) ~= "table"
+			or typeof(point.name) ~= "string"
+			or point.name == ""
+			or typeof(point.position) ~= "Vector3"
+			or seenSniperSpawnNames[point.name] then
+			warn("[EnemyManager] MapContext.sniperSpawnPointsに不正値または重複名があります。敵システムを無効化します")
+			return
+		end
+		seenSniperSpawnNames[point.name] = true
+		table.insert(sniperSpawnPoints, {
+			name = point.name,
+			position = point.position,
+		})
+	end
+	if #sniperSpawnPoints == 0 then
+		warn("[EnemyManager] MapContext.sniperSpawnPointsが空です。敵システムを無効化します")
+		return
+	end
+
+	local contextRoadNetwork = context.roadNetwork
+	if typeof(contextRoadNetwork) ~= "table" or typeof(contextRoadNetwork.nodes) ~= "table" then
+		warn("[EnemyManager] MapContext.roadNetworkが不正です。敵システムを無効化します")
+		return
+	end
+	local roadNodeCount = 0
+	for nodeName, node in contextRoadNetwork.nodes do
+		if typeof(nodeName) ~= "string"
+			or typeof(node) ~= "table"
+			or node.name ~= nodeName
+			or typeof(node.position) ~= "Vector3"
+			or typeof(node.neighbors) ~= "table" then
+			warn(("[EnemyManager] MapContext.roadNetwork.nodes[%s]が不正です。敵システムを無効化します")
+				:format(tostring(nodeName)))
+			return
+		end
+		roadNodeCount += 1
+	end
+	if roadNodeCount == 0 then
+		warn("[EnemyManager] MapContext.roadNetworkにRoadNodeがありません。敵システムを無効化します")
+		return
+	end
+
+	currentMap = context.map
+	mapBounds = {
+		minX = bounds.minX,
+		maxX = bounds.maxX,
+		minZ = bounds.minZ,
+		maxZ = bounds.maxZ,
+	}
+	mapCenter = if typeof(context.center) == "Vector3"
+		then context.center
+		else Vector3.new((bounds.minX + bounds.maxX) / 2, 0, (bounds.minZ + bounds.maxZ) / 2)
+	roadNetwork = contextRoadNetwork
+	systemDisabled = false
+
+	if Config.Threat.DebugLog then
+		print(("[EnemyManager] MapContext設定完了: spawn %d箇所 / SniperSpawn %d箇所 / RoadNode %d個 / center (%.1f, %.1f) / bounds X[%.1f, %.1f] Z[%.1f, %.1f]")
+			:format(#spawnPoints, #sniperSpawnPoints, roadNodeCount, mapCenter.X, mapCenter.Z,
+				mapBounds.minX, mapBounds.maxX, mapBounds.minZ, mapBounds.maxZ))
+	end
 end
 
 --------------------------------------------------------------------
@@ -1283,6 +1992,14 @@ end
 -- transport.cancelled/roundTokenは各yield(Heartbeat:Wait())から戻った直後、
 -- モデルに触れる前に必ず確認する(破棄済みモデルへ誤って触れないため)。
 -- 戻り値: 最後まで飛行できたか(false=中断)
+local function canContinueTransport(model, transport, token)
+	return not transport.cancelled
+		and roundToken == token
+		and aggressive
+		and not retiredSquads[transport.squadId]
+		and model.Parent ~= nil
+end
+
 local function heliFlyTo(model, transport, fromPos, toPos, speed, token)
 	local diff = toPos - fromPos
 	local dist = diff.Magnitude
@@ -1295,7 +2012,7 @@ local function heliFlyTo(model, transport, fromPos, toPos, speed, token)
 
 	while true do
 		local dt = RunService.Heartbeat:Wait()
-		if transport.cancelled or roundToken ~= token or not model.Parent then
+		if not canContinueTransport(model, transport, token) then
 			return false
 		end
 		local remaining = (toPos - pos).Magnitude
@@ -1308,6 +2025,25 @@ local function heliFlyTo(model, transport, fromPos, toPos, speed, token)
 		pos = pos + dir * step
 		model:PivotTo(CFrame.lookAt(pos, pos + dir))
 	end
+end
+
+-- 現在位置から同じ向きのままduration秒だけ投下走行する。
+-- 各Heartbeat復帰後にラウンド・撤退・BATTLE状態を再確認し、戻り値で最終位置を返す。
+local function heliFlyForDuration(model, transport, direction, speed, duration, token)
+	local pos = model:GetPivot().Position
+	local elapsed = 0
+	model:PivotTo(CFrame.lookAt(pos, pos + direction))
+	while elapsed < duration do
+		local dt = RunService.Heartbeat:Wait()
+		if not canContinueTransport(model, transport, token) then
+			return false, pos
+		end
+		local usedDt = math.min(dt, duration - elapsed)
+		elapsed += usedDt
+		pos += direction * speed * usedDt
+		model:PivotTo(CFrame.lookAt(pos, pos + direction))
+	end
+	return true, pos
 end
 
 -- centerからspread以内でランダムにずらした地点を返す(Y座標はcenterのまま。spawnEnemy側で上書きされる)
@@ -1335,8 +2071,8 @@ end
 -- CityGeneratorが建物のModelに付ける HasGableRoof 属性を、そのパーツの親(=建物のModel。
 -- グリッドモードの手続き生成建物ではブロックは必ずそのbuildingのModel直下に置かれる)で確認する。
 -- 戻り値の各要素: { x, z, topY, dist }
-local function findRooftopCandidates(dropPoint)
-	local map = workspace:FindFirstChild("Map")
+local function _findLegacyRooftopCandidates(dropPoint)
+	local map = currentMap
 	if not map then
 		return {}
 	end
@@ -1366,33 +2102,52 @@ local function findRooftopCandidates(dropPoint)
 	return list
 end
 
+-- 予約中・生存中でないSniperSpawnをランダムに1つ予約して返す。
+-- この関数からspawnEnemyまでyieldしないため、同時到着したヘリ間でも重複しない。
+local function reserveSniperSpawn()
+	local available = {}
+	for _, spawnPoint in sniperSpawnPoints do
+		if not occupiedSniperSpawns[spawnPoint.name] then
+			table.insert(available, spawnPoint)
+		end
+	end
+	if #available == 0 then
+		return nil
+	end
+
+	local selected = available[rng:NextInteger(1, #available)]
+	occupiedSniperSpawns[selected.name] = true
+	return selected
+end
+
 -- ヘリ到着イベントからの同時配置(Step5-2)。entry.arrivalSpawnsの各typeをcount体ぶん、
--- 同一フレーム内で生成する(降下演出は使わない。屋上へ直接出現させる)。
--- placement=="rooftop"は異なるBuildingIdの屋上候補を1棟ずつ割り当て、候補不足ぶんは
--- dropPoint付近の地上(既存のLandingSpread)へフォールバックする
-local function spawnArrivalUnits(squadId, arrivalSpawns, dropPoint)
-	local cfg = Config.Threat.HelicopterTransport
+-- 同一フレーム内で生成する(降下演出は使わない)。固定MAPではplacement=="rooftop"を
+-- Metadata.SniperSpawnsからの配置として扱い、屋上自動探索や地上フォールバックは行わない。
+local function spawnArrivalUnits(squadId, arrivalSpawns)
 	for _, spawnEntry in arrivalSpawns do
 		if spawnEntry.placement ~= "rooftop" then
 			warn(("[EnemyManager] 未知のplacement '%s' (タイプ '%s') のarrivalSpawnsを無視します")
 				:format(tostring(spawnEntry.placement), spawnEntry.type))
 		else
-			local etype = Config.Threat.EnemyTypes[spawnEntry.type]
-			local rootOffset = (etype and etype.StandingRootOffset) or 0
-			local candidates = findRooftopCandidates(dropPoint)
-			for i = 1, spawnEntry.count do
-				local candidate = candidates[i]
-				local pos
-				if candidate then
-					pos = Vector3.new(candidate.x, candidate.topY + rootOffset, candidate.z)
+			local warnedNoSpawn = false
+			for _ = 1, spawnEntry.count do
+				local spawnPoint = reserveSniperSpawn()
+				if not spawnPoint then
+					if not warnedNoSpawn then
+						warn("[EnemyManager] SniperSpawnの空きがないためSpawnをスキップします")
+						warnedNoSpawn = true
+					end
 				else
-					pos = jitterPoint(dropPoint, cfg.LandingSpread) -- 屋上不足時は地上フォールバック
-				end
-				local enemy = spawnEnemy(spawnEntry.type, pos, squadId)
-				if not enemy then
-					-- systemDisabled等で失敗しても、この個体ぶんのpendingは必ず消費する(§4の急所)
-					warn(("[EnemyManager] 到着時配置で%sの生成に失敗しました (squad=%d)")
-						:format(spawnEntry.type, squadId))
+					local enemy = spawnEnemy(spawnEntry.type, spawnPoint.position, squadId, {
+						alignToGround = true,
+						sniperSpawnName = spawnPoint.name,
+					})
+					if not enemy then
+						occupiedSniperSpawns[spawnPoint.name] = nil
+						-- systemDisabled等で失敗しても、この個体ぶんのpendingは必ず消費する(§4の急所)
+						warn(("[EnemyManager] 到着時配置で%sの生成に失敗しました (squad=%d)")
+							:format(spawnEntry.type, squadId))
+					end
 				end
 				decrementPending(squadId)
 			end
@@ -1404,7 +2159,7 @@ end
 -- 同時エントリが無い前提だが、将来混在しても後続entryをブロックしない設計にはしていない。
 -- 現状の★2編成が単一entryのため許容する)
 local function deployByHelicopter(squadId, entry, token)
-	if roundToken ~= token or retiredSquads[squadId] then
+	if roundToken ~= token or retiredSquads[squadId] or not aggressive then
 		return
 	end
 	local cfg = Config.Threat.HelicopterTransport
@@ -1419,17 +2174,37 @@ local function deployByHelicopter(squadId, entry, token)
 	end
 	pendingDeployments[squadId] = (pendingDeployments[squadId] or 0) + totalPending
 
-	local dropPoint = pickSpawnPoint(nil) -- 既存のMinDistanceFromPlayerルールをそのまま使う(§9-1)
+	local dropPoint = pickSpawnPoint(nil) -- MapContextのspawn候補へ既存MinDistanceルールを適用する
+	if not dropPoint then
+		warn(("[EnemyManager] ヘリ投下地点を選べないため派遣を中止します (squad=%d)"):format(squadId))
+		for _ = 1, totalPending do
+			decrementPending(squadId)
+		end
+		return
+	end
 	local axisIsX = rng:NextNumber() < 0.5
-	local sign = if rng:NextNumber() < 0.5 then 1 else -1
-	local farDist = cityBounds + cfg.EntryMargin
+	local enterFromPositiveSide = rng:NextNumber() < 0.5
 	local entryPos, exitPos
 	if axisIsX then
-		entryPos = Vector3.new(sign * farDist, cfg.Altitude, dropPoint.Z)
-		exitPos = Vector3.new(-sign * farDist, cfg.Altitude, dropPoint.Z)
+		local positiveX = mapBounds.maxX + cfg.EntryMargin
+		local negativeX = mapBounds.minX - cfg.EntryMargin
+		if enterFromPositiveSide then
+			entryPos = Vector3.new(positiveX, cfg.Altitude, dropPoint.Z)
+			exitPos = Vector3.new(negativeX, cfg.Altitude, dropPoint.Z)
+		else
+			entryPos = Vector3.new(negativeX, cfg.Altitude, dropPoint.Z)
+			exitPos = Vector3.new(positiveX, cfg.Altitude, dropPoint.Z)
+		end
 	else
-		entryPos = Vector3.new(dropPoint.X, cfg.Altitude, sign * farDist)
-		exitPos = Vector3.new(dropPoint.X, cfg.Altitude, -sign * farDist)
+		local positiveZ = mapBounds.maxZ + cfg.EntryMargin
+		local negativeZ = mapBounds.minZ - cfg.EntryMargin
+		if enterFromPositiveSide then
+			entryPos = Vector3.new(dropPoint.X, cfg.Altitude, positiveZ)
+			exitPos = Vector3.new(dropPoint.X, cfg.Altitude, negativeZ)
+		else
+			entryPos = Vector3.new(dropPoint.X, cfg.Altitude, negativeZ)
+			exitPos = Vector3.new(dropPoint.X, cfg.Altitude, positiveZ)
+		end
 	end
 	local dropAtAltitude = Vector3.new(dropPoint.X, cfg.Altitude, dropPoint.Z)
 
@@ -1453,20 +2228,26 @@ local function deployByHelicopter(squadId, entry, token)
 	-- 到着イベント: arrivalSpawns(Step5-2のSniper等)を同一フレームで生成する。
 	-- 既存のSoldier降下ループより先に行う(§2の急所: 同じヘリの到着イベントから生成する)
 	if entry.arrivalSpawns then
-		spawnArrivalUnits(squadId, entry.arrivalSpawns, dropPoint)
+		spawnArrivalUnits(squadId, entry.arrivalSpawns)
 	end
 
-	-- 兵士を1人ずつ降下させる(DropInterval間隔)
+	-- dropPointからexit方向へ低速前進しながら、現在のヘリXZを基準に1人ずつ投下する。
+	-- DropInterval×DropRunSpeedが個体間隔になり、距離はコードへ固定しない。
+	local dropDirection = (exitPos - dropAtAltitude).Unit
+	local currentDropPos = dropAtAltitude
 	for i = 1, entry.count do
-		if transport.cancelled or roundToken ~= token or retiredSquads[squadId] then
+		if not canContinueTransport(model, transport, token) then
 			cleanup()
 			return
 		end
-		local landPos = jitterPoint(dropPoint, cfg.LandingSpread)
+		currentDropPos = model:GetPivot().Position
+		local dropGroundCenter = Vector3.new(currentDropPos.X, dropPoint.Y, currentDropPos.Z)
+		local landPos = jitterPoint(dropGroundCenter, cfg.LandingSpread)
 		local enemy = spawnEnemy(entry.type, landPos, squadId, {
 			deploying = true,
-			deployFromY = cfg.Altitude - cfg.DropOffsetY,
+			deployFromY = currentDropPos.Y - cfg.DropOffsetY,
 			suppressSpawnEffect = true,
+			alignToGround = true,
 		})
 		if not enemy then
 			-- systemDisabled等でspawnEnemyが失敗した場合でも、この個体ぶんのpendingは
@@ -1475,17 +2256,24 @@ local function deployByHelicopter(squadId, entry, token)
 		end
 		decrementPending(squadId)
 		if i < entry.count then
-			task.wait(cfg.DropInterval)
+			local completed
+			completed, currentDropPos = heliFlyForDuration(
+				model, transport, dropDirection, cfg.DropRunSpeed, cfg.DropInterval, token)
+			if not completed then
+				cleanup()
+				return
+			end
 		end
 	end
 
-	if transport.cancelled or roundToken ~= token then
+	if not canContinueTransport(model, transport, token) then
 		cleanup()
 		return
 	end
 
-	-- 投下地点 → 反対側Exit
-	heliFlyTo(model, transport, dropAtAltitude, exitPos, cfg.ExitSpeed, token)
+	-- 投下走行の最終位置 → 反対側Exit
+	currentDropPos = model:GetPivot().Position
+	heliFlyTo(model, transport, currentDropPos, exitPos, cfg.ExitSpeed, token)
 	cleanup()
 end
 
@@ -1521,6 +2309,10 @@ function EnemyManager.DeploySquad(squadId, squadList)
 						return
 					end
 					local point = pickSpawnPoint(usedPoints)
+					if not point then
+						warn(("[EnemyManager] 敵spawn候補を選べないため派遣を中止します (squad=%d)"):format(squadId))
+						return
+					end
 					if isRoad then
 						-- パトカー(将来の戦車も)は交差点そのものを使う。ジッターをかけると
 						-- 湧いた瞬間どちらの道路線にも乗っていない状態になり横滑りするため(§4-4)
@@ -1532,7 +2324,7 @@ function EnemyManager.DeploySquad(squadId, squadList)
 						local r = jitter * rng:NextNumber(0.5, 1.0)
 						point = Vector3.new(point.X + math.cos(ang) * r, point.Y, point.Z + math.sin(ang) * r)
 					end
-					spawnEnemy(entry.type, point, squadId)
+					spawnEnemy(entry.type, point, squadId, { alignToGround = true })
 					task.wait(Config.Threat.Spawn.Interval)
 					-- task.waitから戻った直後の撤退済みチェック(Step5-0)。待機中に昇格した場合に備える
 					if roundToken ~= token or retiredSquads[squadId] then
@@ -1582,6 +2374,7 @@ function EnemyManager.RetreatSquad(squadId)
 		-- alive=falseはこの時点で設定する。これにより既に予約済みのテレグラフ攻撃も
 		-- resolveAttack()の既存enemy.aliveチェックで無効になる(§8-1)
 		enemy.alive = false
+		releaseSniperSpawn(enemy)
 		model:SetAttribute("Retreating", true)
 		model:SetAttribute("Dead", true) -- 画面端▲インジケータは既存のDead判定で自動的に除外される
 		if enemy.marker then
@@ -1591,11 +2384,16 @@ function EnemyManager.RetreatSquad(squadId)
 			enemy.hitFlash.Enabled = false
 		end
 
-		for _, part in model:GetChildren() do
-			if part:IsA("BasePart") then
+		if enemy.isRig then
+			setRigQueryEnabled(model, false)
+			forEachModelBasePart(model, function(part)
+				part.CanCollide = false
+			end)
+		else
+			forEachModelBasePart(model, function(part)
 				part.CanQuery = false -- バズーカのレイキャストをすり抜けさせる
 				part.CanCollide = false
-			end
+			end)
 		end
 
 		-- 以降updateEnemy(通常のHeartbeatループ)の対象外になる。CountAlive/OnExplosion/攻撃/被弾/
@@ -1612,6 +2410,8 @@ function EnemyManager.RetreatSquad(squadId)
 				core = enemy.core,
 				dir = computeRetreatDirection(enemy.core.Position),
 				startedAt = os.clock(),
+				isRig = enemy.isRig,
+				modelYawOffset = enemy.etype.ModelYawOffset or 0,
 			}
 		end
 	end
@@ -1667,6 +2467,7 @@ function EnemyManager.Clear()
 	table.clear(killCounts) -- RESULTでGetKillCounts()を読み終えた後のLOBBYで呼ばれるので、順序は問題ない
 	table.clear(retiredSquads) -- 次ラウンドでsquadIdが1から再利用されるため必須(Step5-0)
 	table.clear(pendingDeployments) -- 次ラウンドへ持ち越さない(Step5-1)
+	table.clear(occupiedSniperSpawns) -- 生存中・予約中のSniperSpawnをすべて解放する
 	for model in activeTransports do
 		if model.Parent then
 			model:Destroy()
@@ -1681,6 +2482,16 @@ function EnemyManager.Clear()
 		transportFolder:Destroy()
 		transportFolder = nil
 	end
+	-- 次のMapRuntime.LoadRound()でworkspace.MapがCloneし直されるため、旧ラウンドの
+	-- Map Instance・bounds・spawn座標を保持しない。GameManagerが直後にSetMapContextを呼ぶ。
+	currentMap = nil
+	mapBounds = nil
+	mapCenter = nil
+	table.clear(spawnPoints)
+	table.clear(sniperSpawnPoints)
+	roadNetwork = nil
+	roadNavigationWarned = false
+	systemDisabled = true
 end
 
 Players.PlayerRemoving:Connect(function(player)

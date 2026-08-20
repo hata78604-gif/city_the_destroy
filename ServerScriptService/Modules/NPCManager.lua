@@ -25,6 +25,9 @@ local deps = nil -- { addScore(player, points, category), effectRemote }
 local folder = nil -- workspace/NPCs
 local npcs = {} -- 生存中NPCの集合: npcs[npc] = true
 local active = false -- ラウンド中のみスポーンを許可
+local roundToken = 0 -- Clear()のたびに+1。前ラウンドの遅延Respawnを無効化する
+local npcSpawnPoints = {} -- MapContext.npcSpawnPointsの{name, position}コピー。Instanceは保持しない
+local nextSpawnIndex = 1
 
 -- 部位別カラー(R6標準アバター風)。新キーが無い場合は旧来の単色(Config.NPC.Color)に
 -- フォールバックする(Config貼り替え漏れでも生成が止まらないように)
@@ -40,10 +43,25 @@ local FLEE_FADE_TIME = Config.NPC.FleeFadeTime or 1
 local PANIC_TEXT = Config.NPC.PanicText or "help!"
 local BUBBLE_MAX_DISTANCE = Config.NPC.BubbleMaxDistance or 150 -- これより遠いNPCのフキダシは描画しない(負荷対策)
 
--- 徘徊範囲内のランダムな地点(トルソー中心の高さ = 3)
-local function randomPoint()
+-- 徘徊範囲内のランダムな地点(トルソー中心の高さ = 3)。
+-- 既存の徘徊ロジックは維持し、ラウンド開始・再Spawn地点だけ固定MAP Metadataへ差し替える。
+local function randomWanderPoint()
 	local r = Config.NPC.WanderRange
 	return Vector3.new(rng:NextNumber(-r, r), 3, rng:NextNumber(-r, r))
+end
+
+-- NPCSpawn markerは地面表面位置。10体を3 markerへ順番に割り当て、完全な重なりを避けるため
+-- marker付近へ小さく散らす。足元YはspawnNpc側で合わせる。
+local function nextSpawnPoint()
+	if #npcSpawnPoints == 0 then
+		return nil
+	end
+
+	local marker = npcSpawnPoints[nextSpawnIndex]
+	nextSpawnIndex = nextSpawnIndex % #npcSpawnPoints + 1
+	local angle = rng:NextNumber(0, math.pi * 2)
+	local radius = rng:NextNumber(0, 4)
+	return marker.position + Vector3.new(math.cos(angle) * radius, 0, math.sin(angle) * radius)
 end
 
 --------------------------------------------------------------------
@@ -112,14 +130,15 @@ local function createHelpBubble(head)
 	return gui
 end
 
-local function spawnNpc(position)
+local function spawnNpc(groundPosition)
 	if not active or not folder then
 		return
 	end
 	local model = Instance.new("Model")
 	model.Name = "NPC"
 
-	local rootCf = CFrame.new(position)
+	-- この軽量R6モデルはTorso中心から足裏まで3 stud。
+	local rootCf = CFrame.new(groundPosition + Vector3.new(0, 3, 0))
 	local torso = makePart(Vector3.new(1.6, 2, 1), rootCf, model, "Torso", SHIRT_COLOR)
 	local head = makePart(Vector3.new(1.2, 1.2, 1.2), rootCf * CFrame.new(0, 1.7, 0), model, "Head", SKIN_COLOR)
 	local leftArm = makePart(Vector3.new(0.6, 2, 0.6), rootCf * CFrame.new(-1.15, 0, 0), model, "LeftArm", SKIN_COLOR)
@@ -149,7 +168,7 @@ local function spawnNpc(position)
 		rightArm = rightArm,
 		bubbleGui = bubbleGui,
 		alive = true,
-		target = randomPoint(),
+		target = randomWanderPoint(),
 		fleeing = false, -- 逃走中フラグ(消滅処理の二重起動防止)
 		panicUntil = nil, -- パニック終了時刻(os.clock()基準)。nilまたは過去時刻なら通常徘徊
 		fleeDir = nil, -- 逃走方向(水平・正規化済み)。目的地到着後の延長に使う
@@ -220,8 +239,14 @@ local function fleeAway(npc)
 	end)
 
 	-- 頭数維持: 消滅後、別地点へ再スポーン(常時Config.NPC.Count体を保つ)
+	local token = roundToken
 	task.delay(Config.NPC.RespawnDelay, function()
-		spawnNpc(randomPoint())
+		if active and roundToken == token then
+			local point = nextSpawnPoint()
+			if point then
+				spawnNpc(point)
+			end
+		end
 	end)
 end
 
@@ -276,7 +301,7 @@ RunService.Heartbeat:Connect(function(dt)
 					-- パニック中は通常徘徊に戻さず、同じ逃走方向へ目的地を延長する
 					npc.target = pos + npc.fleeDir * 60
 				else
-					npc.target = randomPoint() -- 到着したら次の目的地へ
+					npc.target = randomWanderPoint() -- 到着したら次の目的地へ
 				end
 			else
 				local dir = to.Unit
@@ -344,8 +369,14 @@ local function killNpc(npc, blastPos, attacker, scoreScale)
 	end)
 
 	-- 数秒後に別地点へ再スポーン(常時10体を維持)
+	local token = roundToken
 	task.delay(Config.NPC.RespawnDelay, function()
-		spawnNpc(randomPoint())
+		if active and roundToken == token then
+			local point = nextSpawnPoint()
+			if point then
+				spawnNpc(point)
+			end
+		end
 	end)
 end
 
@@ -373,7 +404,47 @@ function NPCManager.Init(dependencies)
 	deps = dependencies
 end
 
+-- ラウンドごとにMapRuntime.LoadRound()の戻り値を設定する。
+-- Spawn markerのInstance参照は持たず、名前とワールド座標だけをコピーする。
+function NPCManager.SetMapContext(context)
+	table.clear(npcSpawnPoints)
+	nextSpawnIndex = 1
+
+	local points = if typeof(context) == "table" then context.npcSpawnPoints else nil
+	if typeof(points) ~= "table" then
+		warn("[NPCManager] MapContext.npcSpawnPointsがありません。NPC生成を無効化します")
+		return
+	end
+
+	local seenNames = {}
+	for _, point in points do
+		if typeof(point) ~= "table"
+			or typeof(point.name) ~= "string"
+			or point.name == ""
+			or typeof(point.position) ~= "Vector3"
+			or seenNames[point.name] then
+			warn("[NPCManager] MapContext.npcSpawnPointsに不正値または重複名があります。NPC生成を無効化します")
+			table.clear(npcSpawnPoints)
+			return
+		end
+		seenNames[point.name] = true
+		table.insert(npcSpawnPoints, {
+			name = point.name,
+			position = point.position,
+		})
+	end
+
+	if #npcSpawnPoints == 0 then
+		warn("[NPCManager] MapContext.npcSpawnPointsが空です。NPC生成を無効化します")
+	end
+end
+
 function NPCManager.Start()
+	if #npcSpawnPoints == 0 then
+		active = false
+		warn("[NPCManager] 有効なNPCSpawnがないためNPC生成を開始できません")
+		return
+	end
 	active = true
 	if not folder then
 		folder = Instance.new("Folder")
@@ -381,7 +452,10 @@ function NPCManager.Start()
 		folder.Parent = workspace
 	end
 	for _ = 1, Config.NPC.Count do
-		spawnNpc(randomPoint())
+		local point = nextSpawnPoint()
+		if point then
+			spawnNpc(point)
+		end
 	end
 end
 
@@ -392,6 +466,7 @@ end
 
 -- 全NPCを削除する(マップ再生成時。パニック中・逃走中のNPCも含めて全消去)
 function NPCManager.Clear()
+	roundToken += 1
 	active = false
 	for npc in npcs do
 		npc.model:Destroy()
@@ -401,6 +476,8 @@ function NPCManager.Clear()
 		folder:Destroy()
 		folder = nil
 	end
+	table.clear(npcSpawnPoints)
+	nextSpawnIndex = 1
 end
 
 return NPCManager

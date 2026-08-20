@@ -1,0 +1,435 @@
+local Selection = game:GetService("Selection")
+
+--------------------------------------------------------------------
+-- 設定
+--------------------------------------------------------------------
+
+-- 実際の変換コードと同じ値にする
+local MAX_BLOCKS_PER_PART = 12
+local MIN_SPLIT_SIZE = 15
+
+-- 1棟あたりの警告ライン
+local WARNING_PER_BUILDING = 1000
+
+-- 選択した建物全部の合計警告ライン
+local WARNING_TOTAL = 8000
+
+-- 以前の変換ツールが生成したModel識別用
+local GENERATED_ATTRIBUTE = "GeneratedByDestructionConverter"
+
+--------------------------------------------------------------------
+-- 選択確認
+--------------------------------------------------------------------
+
+local selected = Selection:Get()
+
+if #selected == 0 then
+	warn("見積もりたい建物のModel / Folder / Partを選択してください")
+	return
+end
+
+--------------------------------------------------------------------
+-- 親子が両方選択されている場合は親だけ処理
+--------------------------------------------------------------------
+
+local selectedSet = {}
+
+for _, obj in ipairs(selected) do
+	selectedSet[obj] = true
+end
+
+local roots = {}
+
+for _, obj in ipairs(selected) do
+	local ancestor = obj.Parent
+	local hasSelectedAncestor = false
+
+	while ancestor do
+		if selectedSet[ancestor] then
+			hasSelectedAncestor = true
+			break
+		end
+
+		ancestor = ancestor.Parent
+	end
+
+	if not hasSelectedAncestor then
+		table.insert(roots, obj)
+	end
+end
+
+--------------------------------------------------------------------
+-- 分割対象判定
+--------------------------------------------------------------------
+
+local function shouldSplit(source)
+
+	-- MeshPartは分割しない
+	if source:IsA("MeshPart") then
+		return false
+	end
+
+	-- 普通のPart以外は分割しない
+	-- WedgePart / CornerWedgePartなど
+	if not source:IsA("Part") then
+		return false
+	end
+
+	-- Ball / Cylinderなどは分割しない
+	if source.Shape ~= Enum.PartType.Block then
+		return false
+	end
+
+	local size = source.Size
+
+	return size.X >= MIN_SPLIT_SIZE
+		or size.Y >= MIN_SPLIT_SIZE
+		or size.Z >= MIN_SPLIT_SIZE
+end
+
+--------------------------------------------------------------------
+-- 分割数計算
+--
+-- 実際の変換コードと同じ計算
+--------------------------------------------------------------------
+
+local function calculateDivisions(size)
+
+	local bestX = 1
+	local bestY = 1
+	local bestZ = 1
+
+	local bestScore = math.huge
+	local bestTotal = 1
+
+	for x = 1, MAX_BLOCKS_PER_PART do
+		for y = 1, MAX_BLOCKS_PER_PART do
+			for z = 1, MAX_BLOCKS_PER_PART do
+
+				local total = x * y * z
+
+				if total <= MAX_BLOCKS_PER_PART then
+
+					local cellX = size.X / x
+					local cellY = size.Y / y
+					local cellZ = size.Z / z
+
+					local score = math.max(
+						cellX,
+						cellY,
+						cellZ
+					)
+
+					if score < bestScore
+						or (
+							math.abs(score - bestScore) < 0.001
+							and total > bestTotal
+						) then
+
+						bestScore = score
+						bestTotal = total
+
+						bestX = x
+						bestY = y
+						bestZ = z
+					end
+				end
+			end
+		end
+	end
+
+	return bestX, bestY, bestZ
+end
+
+--------------------------------------------------------------------
+-- 変換済みModel内部か確認
+--------------------------------------------------------------------
+
+local function isInsideGeneratedModel(obj)
+
+	local current = obj.Parent
+
+	while current do
+
+		if current:GetAttribute(GENERATED_ATTRIBUTE) == true then
+			return true
+		end
+
+		current = current.Parent
+	end
+
+	return false
+end
+
+--------------------------------------------------------------------
+-- BasePart一覧取得
+--------------------------------------------------------------------
+
+local function collectParts(root)
+
+	local parts = {}
+
+	if root:IsA("BasePart") then
+
+		table.insert(parts, root)
+
+	elseif root:IsA("Model") or root:IsA("Folder") then
+
+		for _, obj in ipairs(root:GetDescendants()) do
+
+			if obj:IsA("BasePart")
+				and not isInsideGeneratedModel(obj) then
+
+				table.insert(parts, obj)
+			end
+		end
+	end
+
+	return parts
+end
+
+--------------------------------------------------------------------
+-- 1棟見積もり
+--------------------------------------------------------------------
+
+local function estimateBuilding(root)
+
+	local parts = collectParts(root)
+
+	local originalCount = #parts
+
+	local estimatedCount = 0
+
+	local meshCount = 0
+	local splitSourceCount = 0
+	local copiedCount = 0
+
+	local splitGeneratedCount = 0
+
+	for _, part in ipairs(parts) do
+
+		------------------------------------------------------------
+		-- MeshPart
+		------------------------------------------------------------
+
+		if part:IsA("MeshPart") then
+
+			meshCount += 1
+			copiedCount += 1
+			estimatedCount += 1
+
+		------------------------------------------------------------
+		-- 分割対象
+		------------------------------------------------------------
+
+		elseif shouldSplit(part) then
+
+			local divX, divY, divZ =
+				calculateDivisions(part.Size)
+
+			local generated =
+				divX * divY * divZ
+
+			splitSourceCount += 1
+			splitGeneratedCount += generated
+
+			estimatedCount += generated
+
+		------------------------------------------------------------
+		-- そのままコピー
+		------------------------------------------------------------
+
+		else
+
+			copiedCount += 1
+			estimatedCount += 1
+		end
+	end
+
+	return {
+		Name = root.Name,
+
+		OriginalCount = originalCount,
+
+		EstimatedCount = estimatedCount,
+
+		MeshCount = meshCount,
+
+		SplitSourceCount = splitSourceCount,
+
+		SplitGeneratedCount = splitGeneratedCount,
+
+		CopiedCount = copiedCount,
+	}
+end
+
+--------------------------------------------------------------------
+-- 全体集計
+--------------------------------------------------------------------
+
+local totalOriginal = 0
+local totalEstimated = 0
+
+local totalMesh = 0
+local totalSplitSources = 0
+local totalSplitGenerated = 0
+local totalCopied = 0
+
+local validBuildings = 0
+
+print("")
+print("==================================================")
+print("      破壊用Model 事前見積もり")
+print("==================================================")
+
+for _, root in ipairs(roots) do
+
+	if root:IsA("Model")
+		or root:IsA("Folder")
+		or root:IsA("BasePart") then
+
+		local result =
+			estimateBuilding(root)
+
+		validBuildings += 1
+
+		totalOriginal += result.OriginalCount
+		totalEstimated += result.EstimatedCount
+
+		totalMesh += result.MeshCount
+		totalSplitSources += result.SplitSourceCount
+		totalSplitGenerated += result.SplitGeneratedCount
+		totalCopied += result.CopiedCount
+
+		print("")
+		print(
+			("【%s】")
+				:format(result.Name)
+		)
+
+		print(
+			("元BasePart数       : %d")
+				:format(result.OriginalCount)
+		)
+
+		print(
+			("MeshPart           : %d")
+				:format(result.MeshCount)
+		)
+
+		print(
+			("分割対象Part       : %d")
+				:format(result.SplitSourceCount)
+		)
+
+		print(
+			("分割後Part         : %d")
+				:format(result.SplitGeneratedCount)
+		)
+
+		print(
+			("分割しないPart     : %d")
+				:format(result.CopiedCount)
+		)
+
+		print(
+			("★予想生成Part数    : %d")
+				:format(result.EstimatedCount)
+		)
+
+		------------------------------------------------------------
+		-- 1棟警告
+		------------------------------------------------------------
+
+		if result.EstimatedCount >= WARNING_PER_BUILDING then
+
+			warn(
+				(
+					"⚠ %s は破壊用Partが %d 個になる見込みです"
+				):format(
+					result.Name,
+					result.EstimatedCount
+				)
+			)
+		end
+	end
+end
+
+--------------------------------------------------------------------
+-- 合計
+--------------------------------------------------------------------
+
+print("")
+print("==================================================")
+print("               全体見積もり")
+print("==================================================")
+
+print(
+	("対象建物数         : %d")
+		:format(validBuildings)
+)
+
+print(
+	("元BasePart合計     : %d")
+		:format(totalOriginal)
+)
+
+print(
+	("MeshPart合計       : %d")
+		:format(totalMesh)
+)
+
+print(
+	("分割対象Part合計   : %d")
+		:format(totalSplitSources)
+)
+
+print(
+	("分割後Part合計     : %d")
+		:format(totalSplitGenerated)
+)
+
+print(
+	("分割しないPart合計 : %d")
+		:format(totalCopied)
+)
+
+print("")
+print(
+	("★★ 予想生成Part合計 : %d ★★")
+		:format(totalEstimated)
+)
+
+print("")
+
+--------------------------------------------------------------------
+-- 全体警告
+--------------------------------------------------------------------
+
+if totalEstimated >= WARNING_TOTAL then
+
+	warn(
+		(
+			"⚠ 合計 %d Partです。"
+			.. "破壊用モデル全体としてかなり多くなっています。"
+		):format(totalEstimated)
+	)
+
+elseif totalEstimated >= 5000 then
+
+	warn(
+		(
+			"△ 合計 %d Partです。"
+			.. "使用可能な範囲ですが、同時に大量の破片を物理演算させない設計を推奨します。"
+		):format(totalEstimated)
+	)
+
+else
+
+	print(
+		("○ 合計 %d Part：現在の想定範囲内です")
+			:format(totalEstimated)
+	)
+end
+
+print("==================================================")

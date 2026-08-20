@@ -1,0 +1,66 @@
+STEP3-v05 Kaiju Blockout generation report
+Status: PASS
+Builder dependency: NONE (independent v05 build)
+Blender: 5.2.0 LTS
+Forward axis: -Y
+Unit system: Metric / Meters / scale 1.0
+Bounds min: (-2.68, -3.20, 0.00)
+Bounds max: (2.68, 8.00, 10.00)
+Dimensions XYZ: (5.35, 11.20, 10.00) m
+CONFIG:
+  height: 10.0
+  forward_axis: -Y
+  body_forward_lean_degrees: 30.0
+  chest_width: 3.65
+  chest_depth: 2.55
+  pelvis_width: 2.9
+  pelvis_depth: 2.95
+  head_length: 2.35
+  head_width: 1.95
+  snout_length: 1.48
+  jaw_gap: 0.035
+  eye_radius: 0.075
+  hip_y: 0.62
+  knee_back: 0.6
+  ankle_forward: 1.03
+  thigh_width: 1.05
+  thigh_depth: 1.18
+  tail_length: 6.8
+  tail_root_radius: 1.38
+  tail_overlap_ratio: 0.2
+  dorsal_count: 7
+  dorsal_embed_ratio: 0.36
+  sphere_segments: 16
+  sphere_rings: 8
+Anchors:
+  pelvis: (0.00, 0.60, 5.12)
+  chest: (0.00, -0.95, 7.78)
+  neck: (0.00, -1.32, 8.28)
+  head: (0.00, -1.90, 8.82)
+  hip_L: (1.08, 0.62, 4.94)
+  knee_L: (1.24, 1.22, 2.76)
+  ankle_L: (1.14, 0.19, 0.70)
+  foot_L: (1.14, -0.63, 0.28)
+  tail_base: (0.00, 1.38, 5.23)
+  tail_end: (0.00, 7.82, 1.92)
+Target height: 10.00 m
+Shoulder width: 3.65 m
+Head length: 2.35 m
+Tail centerline length: 6.80 m
+Forward lean: 30.0 degrees
+Tail root radius: 1.38 m
+Dorsal plates: 7
+Dorsal embed: 36%
+Blockout objects: 55
+Required object check: PASS
+Visual self-evaluation:
+  1. Human-like impression reduction: PASS
+  2. Forward-lean pose: PASS
+  3. Waist kink removal: PASS
+  4. Beast-leg line: PASS
+  5. Tail connection: PASS
+  6. Dorsal connection: PASS
+  7. Crocodilian head: PASS
+  8. Stacked-lip removal: PASS
+  9. Recessed eyes: PASS
+  10. Three-view silhouette: PARTIAL — blockout matches the major masses; exact skin-level contour is deferred.

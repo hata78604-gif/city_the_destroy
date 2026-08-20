@@ -863,6 +863,50 @@ GameManager / DestructionManager / NPCManager / WeaponServer / VisualSetup / ク
 
 ---
 
+## Phase 3-2: ★3 Tank セットアップ・確認
+
+1. `ServerStorage/EnemyModels`へRobloxモデル`15081095657`を挿入し、名前を`Tank`にする。
+   `PrimaryPart`は未設定のままでよい。実行時にEnemyManagerが安全なBasePartへフォールバックする。
+2. `Config` / `GameManager` / `Modules/EnemyManager` / `Modules/DestructionManager`をPhase 3-2版へ更新する。
+3. Play後、スコアを10000にして★3へ進める。`workspace.Enemies`にTankが2台だけ追加され、
+   `ServerStorage.EnemyModels.Tank`内のScriptが実行されていないことを確認する。
+4. Tankが道路に沿って砲身側を前に走り、プレイヤーへ1秒の赤線予告後に砲撃すること、予告中に
+   半径10外へ移動すれば回避できることを確認する。
+5. Tankの周囲90stud以内の建物が4秒間隔で壊れること、破壊されたブロックでスコアが増えないこと、
+   Tank自身が自分の砲撃で被弾しないことを確認する。
+6. Tankの砲身・履帯など、従来のcoreから離れた外周へバズーカを3回当て、1・2発目は生存、3発目で
+   全体が約0.65秒フェードして消え、2500点/+15秒が1回だけ入ることを確認する。透明な`DamageHitbox`は
+   `CanQuery=false`なので、弾のレイキャストを遮らない。
+7. 2台のうち1台だけを撃破し、撃破から30秒後にTankが1台だけ補充されることを確認する。残りの1台を
+   撃破した場合も、その撃破時刻から別に30秒後に1台だけ補充されること。
+8. 回帰確認として★1でPoliceCar×2+PoliceOfficer×2、★2でSoldier×4+Sniper×2が従来どおり出ることを確認する。
+
+ローカルRojoプロジェクトにはToolboxモデルを含めていないため、別Placeへ導入する場合も手順1は必要。
+
+## Phase 3-2a: ラウンド開始位置・敵接地・ヘリ投下ライン確認
+
+追加アセットやStudioでの手動設定は不要。`Config` / `GameManager` / `Modules/EnemyManager`を
+Phase 3-2a版へ同期して、次を確認する。
+
+1. 1ラウンド終了時にMAP内の任意の遠い場所へ移動し、RESULTの「次へ」を押す。次ラウンドでは
+   前ラウンド終了地点ではなく、固定MAPの`SpawnLocation`から新しいCharacterで始まること。
+2. BATTLE開始時、Bazooka / Airstrike / RemoteBombが各1個だけ存在し、再生成による二重配布が無いこと。
+3. ★1でPoliceOfficerをプレイヤー近くへ停止させ、PoliceCarを道路目的地へ停車させる。
+   6秒以上観察して地面へ沈み続けず、XZや向きが不自然に変化しないこと。
+   PoliceOfficer / SoldierはEnemySpawn markerのY値ではなく、直下へRaycastしたMAP表面とR15の足裏を
+   基準に接地する。道路上を移動中も足が浮かず、段差があれば正しい表面Yへ追従すること。
+4. ★2でSoldierの着地後とSniperの屋上配置後を6秒以上観察し、Soldierが地面へ沈み続けず、
+   Sniperが地上へワープしないこと。
+5. ★2ヘリがdropPoint到着後もexit方向へ低速前進し、Soldier 4人を約1秒間隔・約30 studs間隔の
+   1本のラインとして投下すること。Sniperは従来どおり到着時に1回だけ屋上へ出ること。
+6. 1人目のSoldier投下直後にスコアを10000へ上げ、★3へ移行する。既に出たSoldier / Sniperは
+   撤退せず残り、Tank 2台が追加されること。★2 squadには20秒ごとのヘリ・Soldier・Sniper増援も
+   ★4へ昇格するまで継続すること。
+7. ★3でTankを道路目的地へ停車させ、6秒以上観察して車体Yと向きが維持されること。
+
+調整が必要な場合は`Config.Threat.HelicopterTransport.DropInterval`と`DropRunSpeed`だけを変更する。
+初期値は`1.0`秒と`30` studs/sで、投下中心間隔は両者の積になる。
+
 ## 9. 公開するとき(おまけ)
 
 `ファイル → Roblox に公開` でアップロードできます。

@@ -177,8 +177,248 @@ local function readBounds(mapBounds)
 	}
 end
 
+local function prepareEnemySpawnPoints(metadata)
+	local enemySpawns = metadata:FindFirstChild("EnemySpawns")
+	if not enemySpawns then
+		warn("[MapRuntime] Metadata.EnemySpawns が見つかりません。敵システムは無効になります")
+		return {}
+	end
+	if not enemySpawns:IsA("Folder") then
+		warn(("[MapRuntime] %s は Folder である必要があります (実際: %s)。敵システムは無効になります")
+			:format(enemySpawns:GetFullName(), enemySpawns.ClassName))
+		return {}
+	end
+
+	local points = {}
+	for _, marker in enemySpawns:GetChildren() do
+		if marker:IsA("BasePart") then
+			-- Metadataマーカーはゲーム内の物理・接触・Raycastへ一切影響させない。
+			-- Studio側の設定に依存せず、Cloneしたラウンド用MAPで毎回保証する。
+			marker.Anchored = true
+			marker.CanCollide = false
+			marker.CanTouch = false
+			marker.CanQuery = false
+			marker.Transparency = 1
+			table.insert(points, marker.Position) -- Instance参照は保持せず、ワールド座標だけを公開する
+		else
+			warn(("[MapRuntime] %s は BasePart ではないため敵spawn候補から除外します")
+				:format(marker:GetFullName()))
+		end
+	end
+
+	if #points == 0 then
+		warn("[MapRuntime] Metadata.EnemySpawns に有効なBasePartがありません。敵システムは無効になります")
+	end
+	return points
+end
+
+-- SniperSpawn markerは名前と足元接地面のワールド座標だけをMapContextへ公開する。
+-- configureMarkers=trueはClone後のラウンド用MAPにだけ使用し、Studio原本は変更しない。
+local function prepareSniperSpawnPoints(metadata, configureMarkers)
+	local sniperSpawns = requireChild(metadata, "SniperSpawns", "Folder")
+	local seenNames = {}
+	local markers = {}
+
+	for _, marker in sniperSpawns:GetChildren() do
+		if not marker:IsA("BasePart") then
+			error(("[MapRuntime] %s は BasePart である必要があります (実際: %s)")
+				:format(marker:GetFullName(), marker.ClassName))
+		end
+		if seenNames[marker.Name] then
+			error(("[MapRuntime] SniperSpawn名 '%s' が重複しています"):format(marker.Name))
+		end
+		seenNames[marker.Name] = true
+
+		if configureMarkers then
+			marker.Anchored = true
+			marker.CanCollide = false
+			marker.CanTouch = false
+			marker.CanQuery = false
+			marker.Transparency = 1
+		end
+
+		table.insert(markers, {
+			name = marker.Name,
+			position = marker.Position,
+		})
+	end
+
+	if #markers == 0 then
+		error("[MapRuntime] SniperSpawns に有効なSpawn markerがありません")
+	end
+
+	table.sort(markers, function(a, b)
+		return a.name < b.name
+	end)
+	return markers
+end
+
+-- BossSpawnは将来のBoss生成へ渡す位置情報の基盤だけを用意する。
+-- 現PhaseではBoss本体の選択・生成・移動・戦闘には使用しない。
+local function prepareBossSpawnPoints(metadata, configureMarkers)
+	local bossSpawns = requireChild(metadata, "BossSpawns", "Folder")
+	local seenNames = {}
+	local markers = {}
+
+	for _, marker in bossSpawns:GetChildren() do
+		if not marker:IsA("BasePart") then
+			error(("[MapRuntime] %s は BasePart である必要があります (実際: %s)")
+				:format(marker:GetFullName(), marker.ClassName))
+		end
+		if seenNames[marker.Name] then
+			error(("[MapRuntime] BossSpawn名 '%s' が重複しています"):format(marker.Name))
+		end
+		seenNames[marker.Name] = true
+
+		if configureMarkers then
+			marker.Anchored = true
+			marker.CanCollide = false
+			marker.CanTouch = false
+			marker.CanQuery = false
+			marker.Transparency = 1
+		end
+
+		table.insert(markers, {
+			name = marker.Name,
+			cframe = marker.CFrame,
+			position = marker.Position,
+		})
+	end
+
+	if #markers == 0 then
+		error("[MapRuntime] BossSpawns に有効なSpawn markerがありません")
+	end
+
+	table.sort(markers, function(a, b)
+		return a.name < b.name
+	end)
+	return markers
+end
+
+-- NPCSpawnは将来のNPC生成へ渡す位置情報の基盤だけを用意する。
+-- 現PhaseではNPC本体の選択・生成・移動・パニック処理には使用しない。
+local function prepareNPCSpawnPoints(metadata, configureMarkers)
+	local npcSpawns = requireChild(metadata, "NPCSpawns", "Folder")
+	local seenNames = {}
+	local markers = {}
+
+	for _, marker in npcSpawns:GetChildren() do
+		if not marker:IsA("BasePart") then
+			error(("[MapRuntime] %s は BasePart である必要があります (実際: %s)")
+				:format(marker:GetFullName(), marker.ClassName))
+		end
+		if seenNames[marker.Name] then
+			error(("[MapRuntime] NPCSpawn名 '%s' が重複しています"):format(marker.Name))
+		end
+		seenNames[marker.Name] = true
+
+		if configureMarkers then
+			marker.Anchored = true
+			marker.CanCollide = false
+			marker.CanTouch = false
+			marker.CanQuery = false
+			marker.Transparency = 1
+		end
+
+		table.insert(markers, {
+			name = marker.Name,
+			cframe = marker.CFrame,
+			position = marker.Position,
+		})
+	end
+
+	if #markers == 0 then
+		error("[MapRuntime] NPCSpawns に有効なSpawn markerがありません")
+	end
+
+	table.sort(markers, function(a, b)
+		return a.name < b.name
+	end)
+	return markers
+end
+
+-- Studioで明示されたLinksだけから、双方向の道路グラフを構築する。
+-- 距離による自動接続は行わず、ノード座標は道路表面のワールド座標をそのまま保持する。
+local function prepareRoadNetwork(metadata)
+	local roadNodes = requireChild(metadata, "RoadNodes", "Folder")
+	local nodes = {}
+	local neighborSets = {}
+	local nodeCount = 0
+
+	-- 先に全ノードを登録し、Linksの前方参照も検証できるようにする。
+	for _, child in roadNodes:GetChildren() do
+		if not child:IsA("BasePart") then
+			error(("[MapRuntime] %s は BasePart である必要があります (実際: %s)")
+				:format(child:GetFullName(), child.ClassName))
+		end
+		if nodes[child.Name] then
+			error(("[MapRuntime] RoadNode名 '%s' が重複しています"):format(child.Name))
+		end
+
+		nodes[child.Name] = {
+			name = child.Name,
+			position = child.Position,
+			neighbors = {},
+		}
+		neighborSets[child.Name] = {}
+		nodeCount += 1
+	end
+
+	if nodeCount == 0 then
+		error("[MapRuntime] Metadata.RoadNodes にRoadNodeがありません")
+	end
+
+	for _, child in roadNodes:GetChildren() do
+		local links = child:GetAttribute("Links")
+		if links ~= nil and typeof(links) ~= "string" then
+			error(("[MapRuntime] RoadNode '%s' のLinks属性はStringである必要があります (実際: %s)")
+				:format(child.Name, typeof(links)))
+		end
+
+		if links then
+			for _, rawName in string.split(links, ",") do
+				local linkedName = rawName:match("^%s*(.-)%s*$")
+				if linkedName ~= "" then
+					if linkedName == child.Name then
+						error(("[MapRuntime] RoadNode '%s' は自分自身へリンクできません"):format(child.Name))
+					end
+					if not nodes[linkedName] then
+						error(("[MapRuntime] RoadNode '%s' のLinksが存在しないRoadNode '%s' を参照しています")
+							:format(child.Name, linkedName))
+					end
+
+					-- setへ入れて重複を除き、逆向きも同時に追加する。
+					neighborSets[child.Name][linkedName] = true
+					neighborSets[linkedName][child.Name] = true
+				end
+			end
+		end
+	end
+
+	for nodeName, node in nodes do
+		for neighborName in neighborSets[nodeName] do
+			table.insert(node.neighbors, neighborName)
+		end
+		table.sort(node.neighbors)
+	end
+
+	if nodeCount == 1 then
+		warn("[MapRuntime] RoadNodeが1個だけのため、パトカーが移動できる範囲は限定されます")
+	end
+
+	return {
+		nodes = nodes,
+	}
+end
+
 function MapRuntime.LoadRound()
 	local template = validateTemplate()
+	-- 詳細なMAPメタデータ検証も既存MAPを消す前に完了させる。
+	local templateMetadata = requireChild(template, "Metadata", "Folder")
+	local roadNetwork = prepareRoadNetwork(templateMetadata)
+	prepareSniperSpawnPoints(templateMetadata, false)
+	prepareBossSpawnPoints(templateMetadata, false)
+	prepareNPCSpawnPoints(templateMetadata, false)
 
 	-- 原本が正常であることを確認できた後でだけ、前ラウンドのMAPを削除する。
 	local oldMap = workspace:FindFirstChild("Map")
@@ -201,14 +441,34 @@ function MapRuntime.LoadRound()
 
 	local buildings = prepareBuildings(buildingsFolder)
 	local bounds = readBounds(mapBounds)
+	local center = Vector3.new(
+		(bounds.minX + bounds.maxX) / 2,
+		0,
+		(bounds.minZ + bounds.maxZ) / 2
+	)
+	local enemySpawnPoints = prepareEnemySpawnPoints(metadata)
+	local sniperSpawnPoints = prepareSniperSpawnPoints(metadata, true)
+	local bossSpawnPoints = prepareBossSpawnPoints(metadata, true)
+	local npcSpawnPoints = prepareNPCSpawnPoints(metadata, true)
 
-	print(("[MapRuntime] 固定MAPをロードしました: 建物 %d棟 / bounds X[%.1f, %.1f] Z[%.1f, %.1f]")
-		:format(#buildings, bounds.minX, bounds.maxX, bounds.minZ, bounds.maxZ))
+	local roadNodeCount = 0
+	for _ in roadNetwork.nodes do
+		roadNodeCount += 1
+	end
+	print(("[MapRuntime] 固定MAPをロードしました: 建物 %d棟 / 敵spawn %d箇所 / SniperSpawn %d箇所 / BossSpawn %d箇所 / NPCSpawn %d箇所 / RoadNode %d個 / bounds X[%.1f, %.1f] Z[%.1f, %.1f]")
+		:format(#buildings, #enemySpawnPoints, #sniperSpawnPoints, #bossSpawnPoints, #npcSpawnPoints, roadNodeCount,
+			bounds.minX, bounds.maxX, bounds.minZ, bounds.maxZ))
 
 	return {
 		map = map,
 		buildings = buildings,
 		bounds = bounds,
+		center = center,
+		enemySpawnPoints = enemySpawnPoints,
+		sniperSpawnPoints = sniperSpawnPoints,
+		bossSpawnPoints = bossSpawnPoints,
+		npcSpawnPoints = npcSpawnPoints,
+		roadNetwork = roadNetwork,
 	}
 end
 

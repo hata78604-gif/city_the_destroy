@@ -266,6 +266,7 @@ local function destroyBlockReal(part, ctx)
 	-- タグを付け替え(二重破壊の防止 + 瓦礫であることの目印)
 	CollectionService:RemoveTag(part, "Destructible")
 	CollectionService:AddTag(part, "Debris")
+	part.CanQuery = false -- 後続爆弾の地表面・遮蔽Raycastから瓦礫を除外する
 
 	part.Anchored = false
 	part.CollisionGroup = "Debris"
@@ -338,6 +339,7 @@ local function tryRubbleify(part, ctx)
 	-- 二重破壊の防止(既にDestructibleタグは外れているが念のため)+ 全壊判定・破壊率・
 	-- スナイパー屋上候補(EnemyManager.findRooftopCandidates)から外す(BuildingIdを外す)
 	CollectionService:RemoveTag(part, "Destructible")
+	part.CanQuery = false -- 残骸化した時点で後続Raycastから除外する
 
 	local newHeight = math.min(part.Size.Y, RUBBLE_HEIGHT) -- 元のサイズより大きくはしない
 	part.Size = Vector3.new(part.Size.X * RUBBLE_SPREAD, newHeight, part.Size.Z * RUBBLE_SPREAD)
@@ -376,6 +378,7 @@ local function spawnDummyDebris(map, center, radius, count)
 			120 + rng:NextInteger(-15, 15), 118 + rng:NextInteger(-15, 15), 112 + rng:NextInteger(-15, 15))
 		part.Material = Enum.Material.Concrete
 		part.CanCollide = false -- 見た目だけなので衝突計算を省いて軽くする
+		part.CanQuery = false -- ダミー破片を後続爆弾のRaycastから除外する
 		part.CastShadow = false
 		part.Anchored = false
 		part.CollisionGroup = "Debris"
@@ -400,6 +403,7 @@ end
 --     bonusPolicy= string?,   -- 既定 "normal"。"deny"=なし、"contribution"=首位貢献率で判定
 --     sourceEnemyModel=Model?,-- 敵が起こした爆発の発生元。EnemyManagerの自己被弾除外用
 --     silent     = boolean?,  -- 既定 false。true なら "explosion" エフェクトを送らない
+--     respectOcclusion = boolean?, -- trueのとき爆心から候補までのMAP遮蔽を確認する(Airstrike専用)
 -- }
 --
 -- ▼ ctx.scoreScale の契約(Step4aで確定。Configキーではなくコード上の約束事)
@@ -437,6 +441,28 @@ function DestructionManager.Explode(ctx)
 			if CollectionService:HasTag(part, "Destructible") then
 				table.insert(hits, part)
 			end
+		end
+
+		-- Airstrikeだけ、距離ソート・realCap・破壊率計算へ進む前に遮蔽された候補を除外する。
+		-- Debris/Rubbleは破壊時にCanQuery=falseへ切り替えるため、このRaycastを遮らない。
+		if ctx.respectOcclusion == true and #hits > 0 then
+			local visibleHits = {}
+			local rayParams = RaycastParams.new()
+			rayParams.FilterType = Enum.RaycastFilterType.Include
+			rayParams.FilterDescendantsInstances = { map, workspace.Terrain }
+			rayParams.IgnoreWater = true
+
+			for _, candidate in ipairs(hits) do
+				local direction = candidate.Position - position
+				if direction.Magnitude > 0.001 then
+					local result = workspace:Raycast(position, direction, rayParams)
+					if result and result.Instance == candidate then
+						table.insert(visibleHits, candidate)
+					end
+				end
+			end
+
+			hits = visibleHits
 		end
 
 		if #hits > 0 then

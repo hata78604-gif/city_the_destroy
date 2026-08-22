@@ -38,6 +38,7 @@ local toolFolder = nil -- ツールのテンプレート置き場
 local projectileFolder = nil -- 弾・爆弾の置き場
 local roundActive = false -- バトル中だけ発射を受け付ける
 local roundToken = 0 -- SetRoundActive(false)のたびに+1。前ラウンドの遅延攻撃を無効化する
+local airstrikeBounds = nil -- SetMapContextで受け取る数値コピー。Map Instanceは保持しない
 
 -- プレイヤーごとの状態: { cooldownUntil = {武器名=時刻}, bombs = {設置爆弾}, scoreValue = IntValue }
 local playerData = {}
@@ -246,12 +247,53 @@ end
 -- エアストライク(絨毯爆撃。Step4c)
 -- マーカー(矩形)表示 → Delay秒後に編隊が爆撃線の上を通過しながら順次投下
 --------------------------------------------------------------------
--- 爆弾1発。投下地点の真上から落下して着弾で爆発する
-local function dropBomb(player, ground, wc, withWhistle, token)
+-- 指定XZ直下の、現在のMAPで最初に当たる地表面を返す。
+-- 爆心のYはクリック位置やDropHeightから決めず、ラウンドのboundsからRaycast範囲を作る。
+local function resolveAirstrikeSurface(xz, bounds, wc)
+	local map = workspace:FindFirstChild("Map")
+	local terrain = workspace.Terrain
+	if not bounds or not map or not terrain then
+		return nil
+	end
+
+	local margin = wc.SurfaceProbeMargin
+	local offset = wc.SurfaceOffset
+	if typeof(margin) ~= "number" or typeof(offset) ~= "number"
+		or margin < 0 or bounds.maxY < bounds.minY then
+		return nil
+	end
+
+	local params = RaycastParams.new()
+	params.FilterType = Enum.RaycastFilterType.Include
+	params.FilterDescendantsInstances = { map, terrain }
+	params.IgnoreWater = true
+
+	local origin = Vector3.new(xz.X, bounds.maxY + margin, xz.Z)
+	local direction = Vector3.new(0, -(bounds.maxY - bounds.minY + margin * 2), 0)
+	local result = workspace:Raycast(origin, direction, params)
+	if not result then
+		return nil
+	end
+	return result.Position + result.Normal * offset
+end
+
+-- 爆弾1発。投下地点の真上から落下して着弾で爆発する。
+-- surfacePositionは投下直前にサーバーRaycastで解決した値だけを受け取る。
+local function dropBomb(player, dropXZ, wc, withWhistle, token, strikeState)
 	if not roundActive or roundToken ~= token then
 		return
 	end
-	local start = ground + Vector3.new(0, wc.DropHeight, 0)
+
+	local surfacePosition = resolveAirstrikeSurface(dropXZ, airstrikeBounds, wc)
+	if not surfacePosition then
+		if strikeState and not strikeState.warned then
+			strikeState.warned = true
+			warn("[Airstrike] 地表面Raycastに失敗したため、該当する爆弾をスキップします")
+		end
+		return
+	end
+
+	local start = surfacePosition + Vector3.new(0, wc.DropHeight, 0)
 
 	local bomb = Instance.new("Part")
 	bomb.Shape = Enum.PartType.Ball
@@ -267,24 +309,25 @@ local function dropBomb(player, ground, wc, withWhistle, token)
 	-- 落下音は先頭の1発だけ。18発ぶん鳴らすと音が団子になる。
 	-- ただし全廃はしない(「飛来→落下→着弾」の音の流れが崩れるため)
 	if withWhistle then
-		remotes.Effect:FireAllClients("whistle", { position = ground })
+		remotes.Effect:FireAllClients("whistle", { position = surfacePosition })
 	end
 
 	-- 加速しながら落下 → 着地で爆発
 	local tween = TweenService:Create(bomb,
 		TweenInfo.new(wc.FallTime, Enum.EasingStyle.Quad, Enum.EasingDirection.In),
-		{ CFrame = CFrame.new(ground) })
+		{ CFrame = CFrame.new(surfacePosition) })
 	tween.Completed:Once(function()
 		bomb:Destroy()
 		if not roundActive or roundToken ~= token then
 			return
 		end
 		Destruction.Explode({
-			position = ground,
+			position = surfacePosition,
 			radius = wc.Radius,
 			attacker = player,
 			source = "Airstrike",
 			maxReal = wc.MaxRealPerBomb,
+			respectOcclusion = true,
 			-- scoreScaleは渡さない(連鎖ボーナスはリモート爆弾専用)
 		})
 	end)
@@ -382,6 +425,7 @@ local function fireAirstrike(player, data, root, targetPos)
 
 	local schedule = buildSchedule(wc)
 	local token = roundToken
+	local strikeState = { warned = false }
 
 	-- 戦闘機の速度は投下スケジュールから導出する(入力値として持たない)。
 	-- 「先頭弾の投下時刻に線の始点上空」「最終弾の投下時刻に線の終点上空」を通過させることで、
@@ -446,8 +490,10 @@ local function fireAirstrike(player, data, root, targetPos)
 		-- 機が始点上空へ到達するのはleadTime後なので、投下も全体をその分だけ後ろへずらす
 		for i, entry in schedule do
 			local along = -half + planeSpeed * entry.at
-			local ground = center + right * planeLateral(entry.plane, wc) + dir * along
-			task.delay(leadTime + entry.at, dropBomb, player, ground, wc, i == 1, token)
+			local dropPoint = center + right * planeLateral(entry.plane, wc) + dir * along
+			-- スケジュールへ保存するのは爆撃点のXZだけ。着弾Yは投下直前に再解決する。
+			entry.xz = Vector3.new(dropPoint.X, 0, dropPoint.Z)
+			task.delay(leadTime + entry.at, dropBomb, player, entry.xz, wc, i == 1, token, strikeState)
 		end
 	end)
 end
@@ -692,11 +738,48 @@ function WeaponServer.RemoveToolsFromAll()
 	end
 end
 
+-- ラウンドごとにMapRuntime.LoadRound()のboundsを数値だけ受け取る。
+-- Map Instanceを保持しないことで、旧ラウンドのMAPを遅延攻撃が参照し続ける事故を防ぐ。
+function WeaponServer.SetMapContext(context)
+	airstrikeBounds = nil
+
+	if typeof(context) ~= "table" then
+		warn("[WeaponServer] MapContextが設定されていません。エアストライクを無効化します")
+		return
+	end
+
+	local bounds = context.bounds
+	local validBounds = typeof(bounds) == "table"
+		and typeof(bounds.minX) == "number"
+		and typeof(bounds.maxX) == "number"
+		and typeof(bounds.minY) == "number"
+		and typeof(bounds.maxY) == "number"
+		and typeof(bounds.minZ) == "number"
+		and typeof(bounds.maxZ) == "number"
+		and bounds.minX <= bounds.maxX
+		and bounds.minY <= bounds.maxY
+		and bounds.minZ <= bounds.maxZ
+	if not validBounds then
+		warn("[WeaponServer] MapContext.boundsが不正です。エアストライクを無効化します")
+		return
+	end
+
+	airstrikeBounds = {
+		minX = bounds.minX,
+		maxX = bounds.maxX,
+		minY = bounds.minY,
+		maxY = bounds.maxY,
+		minZ = bounds.minZ,
+		maxZ = bounds.maxZ,
+	}
+end
+
 -- バトル中フラグ。false にすると発射を受け付けず、設置済み爆弾も片付ける
 function WeaponServer.SetRoundActive(active)
 	roundActive = active
 	if not active then
 		roundToken += 1
+		airstrikeBounds = nil
 		for player, data in playerData do
 			for _, bomb in data.bombs do
 				bomb:Destroy()

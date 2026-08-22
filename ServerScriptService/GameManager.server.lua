@@ -197,6 +197,7 @@ while true do
 	DestructionManager.ClearAllRubble()
 	local mapContext = MapRuntime.LoadRound()
 	local buildings = mapContext.buildings
+	WeaponServer.SetMapContext(mapContext) -- boundsの数値だけをコピーし、エアストライクの地表面Raycastへ渡す
 	EnemyManager.SetMapContext(mapContext) -- 毎ラウンドCloneされた新しいMapContextを設定する
 	NPCManager.SetMapContext(mapContext) -- NPCSpawnの座標コピーだけを保持し、旧Map Instanceは保持しない
 	DestructionManager.SetBuildings(buildings)

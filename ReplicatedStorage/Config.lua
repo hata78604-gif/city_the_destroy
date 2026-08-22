@@ -249,6 +249,8 @@ Config.Weapons = {
 		Cooldown = 20, -- 1ラウンド120秒なので約6回使える
 		Delay = 3, -- マーカー表示から第1弾の投下までの秒数
 		DropHeight = 80, -- 爆弾の落下開始高度(戦闘機の飛行高度でもある)
+		SurfaceProbeMargin = 5, -- MAP最高点より上から地表面を探す余白(stud)
+		SurfaceOffset = 0.15, -- 爆心を着弾面の外側へ出す微小な余白(stud)
 		FallTime = 1.1, -- 落下にかかる秒数
 		PlaneCount = 3, -- 編隊の機数
 		BombsPerPlane = 6, -- 1機あたりの投下数(合計 PlaneCount * BombsPerPlane = 18発)

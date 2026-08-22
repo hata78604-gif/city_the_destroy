@@ -1351,3 +1351,40 @@ C-5(火・煙。フェーズB)は今回のスコープ外。
 開始する。毎回、未破壊MAP、瓦礫・残骸、敵・輸送機、Threat、`RoundClock`、仕様上リセットされる
 スコア等、固定MAP Metadataの再読込、およびOutputの新規エラーなしを、見た目だけでなく内部状態も
 含めて確認する。
+
+---
+
+# エアストライク着弾面・爆発遮蔽修正（2026-08-22）
+
+## 実装内容
+
+- `MapRuntime.lua`のMapContext boundsへ、`Buildings`と`StaticGeometry`の回転込みBasePart AABBから
+  算出する`minY/maxY`を追加した。Studio実測は`Y[-1.0, 131.6]`。
+- `WeaponServer.SetMapContext()`でboundsの数値だけを保持し、各爆弾の投下直前に
+  `workspace.Map`と`workspace.Terrain`をIncludeした下向きRaycastを実行する。失敗時はその爆弾だけを
+  スキップし、Airstrike 1回につき警告を最大1回とした。クリックYや固定Yへのフォールバックは無い。
+- Airstrikeの爆発だけに`respectOcclusion=true`を渡し、`DestructionManager.Explode()`では候補収集後、
+  距離ソート・realCap・スコア・破壊率処理より前に中心Raycastで遮蔽候補を除外する。
+- 本物瓦礫、焼け残り、ダミー破片を生成・変換した時点で`CanQuery=false`にし、後続爆弾の
+  地表面・遮蔽Raycastから除外した。バズーカとリモート爆弾の爆発経路は変更していない。
+
+## 検証結果
+
+- `luau-lsp analyze`成功。今回の変更箇所に新規警告なし。既存の
+  `EffectsClient.client.lua(15,7)`未使用`Players`警告1件は継続。
+- `rojo build default.project.json`成功。対象8ファイルの`git diff --check`成功。
+- 対象Studio `破壊の街のコーデックス！💣.rbxl`で、クリックYを`-100`にしてもTower屋根の
+  実面`Y=131.60`へoffset込み`Y=131.75`で着弾した。MAPの隙間では爆弾がスキップされ、警告は1回だった。
+- 未損傷建物の制御確認は`候補717 / 可視103 / 可視パーツ除去103 / 遮蔽パーツ除去0`。
+  同じXZを破壊後に再Raycastすると、表面は最終的に`Y=130.75`から`Y=118.95`へ下がった。
+- 遮蔽判定は最大`3.62ms/発`、通常の屋根爆発は概ね`0.1〜1.1ms/発`、
+  717候補の制御確認は`2.13ms`。計測用ログは実測後に本番コードから除去した。
+- バズーカとリモート爆弾は各1回の爆発を確認し、Airstrike用遮蔽処理が適用されないことを確認した。
+  一時ログ除去後もStudioでMAPロードとラウンド開始を再確認し、今回実装由来の新規エラーは無かった。
+
+## 未確認・申し送り
+
+- タブレット実機のfpsは未確認。大型ビルへのAirstrike着弾時に30fpsを下回らないことを実機確認する。
+- Sound権限切れ、アーカイブ済みSound、固定MAP TexturePackの既知警告は継続している。
+
+---

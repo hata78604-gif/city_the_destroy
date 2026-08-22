@@ -165,16 +165,44 @@ local function prepareBuildings(buildingsFolder)
 	return buildings
 end
 
-local function readBounds(mapBounds)
-	-- Phase 1では回転なしを検証済み。PositionとSizeだけからAABBを作る。
+-- 回転したBasePartのワールドY方向のextentを、8頂点を列挙せずに求める。
+-- CFrameの各軸のY成分へ各ローカル半サイズを掛けた絶対値の合計が、
+-- そのPartのワールドY軸に投影された半幅になる。
+local function includePartYBounds(part, bounds)
+	local half = part.Size / 2
+	local yExtent = math.abs(part.CFrame.RightVector.Y) * half.X
+		+ math.abs(part.CFrame.UpVector.Y) * half.Y
+		+ math.abs(part.CFrame.LookVector.Y) * half.Z
+	bounds.minY = math.min(bounds.minY, part.Position.Y - yExtent)
+	bounds.maxY = math.max(bounds.maxY, part.Position.Y + yExtent)
+end
+
+local function readBounds(mapBounds, buildingsFolder, staticGeometryFolder)
+	-- MapBoundsは既存どおりXZ範囲のメタデータとして扱う。
+	-- 地表面のY範囲だけはMetadataを除外し、実際のMAPパーツから算出する。
 	local half = mapBounds.Size / 2
 	local position = mapBounds.Position
-	return {
+	local bounds = {
 		minX = position.X - half.X,
 		maxX = position.X + half.X,
+		minY = math.huge,
+		maxY = -math.huge,
 		minZ = position.Z - half.Z,
 		maxZ = position.Z + half.Z,
 	}
+
+	for _, folder in { buildingsFolder, staticGeometryFolder } do
+		for _, descendant in folder:GetDescendants() do
+			if descendant:IsA("BasePart") then
+				includePartYBounds(descendant, bounds)
+			end
+		end
+	end
+
+	if bounds.minY == math.huge then
+		warn("[MapRuntime] Buildings/StaticGeometryにBasePartがないため、boundsのY範囲を算出できません")
+	end
+	return bounds
 end
 
 local function prepareEnemySpawnPoints(metadata)
@@ -439,8 +467,9 @@ function MapRuntime.LoadRound()
 	mapBounds.CanQuery = false
 	mapBounds.Transparency = 1
 
+	local staticGeometryFolder = requireChild(map, "StaticGeometry", "Folder")
 	local buildings = prepareBuildings(buildingsFolder)
-	local bounds = readBounds(mapBounds)
+	local bounds = readBounds(mapBounds, buildingsFolder, staticGeometryFolder)
 	local center = Vector3.new(
 		(bounds.minX + bounds.maxX) / 2,
 		0,
@@ -455,9 +484,9 @@ function MapRuntime.LoadRound()
 	for _ in roadNetwork.nodes do
 		roadNodeCount += 1
 	end
-	print(("[MapRuntime] 固定MAPをロードしました: 建物 %d棟 / 敵spawn %d箇所 / SniperSpawn %d箇所 / BossSpawn %d箇所 / NPCSpawn %d箇所 / RoadNode %d個 / bounds X[%.1f, %.1f] Z[%.1f, %.1f]")
+	print(("[MapRuntime] 固定MAPをロードしました: 建物 %d棟 / 敵spawn %d箇所 / SniperSpawn %d箇所 / BossSpawn %d箇所 / NPCSpawn %d箇所 / RoadNode %d個 / bounds X[%.1f, %.1f] Y[%.1f, %.1f] Z[%.1f, %.1f]")
 		:format(#buildings, #enemySpawnPoints, #sniperSpawnPoints, #bossSpawnPoints, #npcSpawnPoints, roadNodeCount,
-			bounds.minX, bounds.maxX, bounds.minZ, bounds.maxZ))
+			bounds.minX, bounds.maxX, bounds.minY, bounds.maxY, bounds.minZ, bounds.maxZ))
 
 	return {
 		map = map,

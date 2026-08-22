@@ -191,6 +191,8 @@ StarterPlayer/StarterPlayerScripts
 | Cooldown | 20 | 1ラウンド120秒なので約6回使える |
 | Delay | 3 | マーカー表示から第1弾の投下までの秒数 |
 | DropHeight | 80 | 爆弾の落下開始高度(戦闘機の飛行高度でもある) |
+| SurfaceProbeMargin | 5 | `bounds.maxY`より上から地表面Raycastを始める余白 |
+| SurfaceOffset | 0.15 | 着弾面の外側へ爆心を出す微小オフセット |
 | FallTime | 1.1 | 落下にかかる秒数 |
 | PlaneCount | 3 | 編隊の機数 |
 | BombsPerPlane | 6 | 1機あたりの投下数(合計18発) |
@@ -204,6 +206,18 @@ StarterPlayer/StarterPlayerScripts
 
 **`PlaneSpeed`というキーは持たない。** 速度は`LineLength / ((投下数-1) * BombInterval)`で
 導出する(理由は§12-4)。
+
+各爆弾の着弾Yはクリック座標から流用しない。`MapRuntime.LoadRound()`が`Buildings`と
+`StaticGeometry`のBasePartから算出した`bounds.minY/maxY`を`WeaponServer.SetMapContext()`へ
+数値コピーし、投下直前に各爆撃点のXZから下向きサーバーRaycastを行う。RaycastのInclude対象は
+`workspace.Map`と`workspace.Terrain`、`IgnoreWater=true`で、失敗した爆弾はクリックYへ
+フォールバックせずスキップする。赤い矩形マーカーは見た目専用で、着弾・破壊判定には使わない。
+
+Airstrikeの`DestructionManager.Explode()`呼び出しだけが`respectOcclusion=true`を渡す。
+半径内候補を集めた後、距離ソート・`maxReal`・スコア・破壊率処理より前に、爆心から候補中心への
+Raycastで最初のヒットが候補自身であるパーツだけを残す。バズーカ、リモート爆弾、敵の爆発には
+この遮蔽処理を適用しない。破壊済みの本物瓦礫・焼け残り・ダミー破片は`CanQuery=false`となり、
+後続爆弾の地表面・遮蔽Raycastを塞がない。
 
 **Config.Weapons.RemoteBomb.ChainBonus(Step4bで追加)**
 

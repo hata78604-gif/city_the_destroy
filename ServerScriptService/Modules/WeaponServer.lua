@@ -327,7 +327,6 @@ local function dropBomb(player, dropXZ, wc, withWhistle, token, strikeState)
 			attacker = player,
 			source = "Airstrike",
 			maxReal = wc.MaxRealPerBomb,
-			respectOcclusion = true,
 			-- scoreScaleは渡さない(連鎖ボーナスはリモート爆弾専用)
 		})
 	end)

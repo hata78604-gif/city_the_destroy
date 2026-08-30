@@ -1388,3 +1388,61 @@ C-5(火・煙。フェーズB)は今回のスコープ外。
 - Sound権限切れ、アーカイブ済みSound、固定MAP TexturePackの既知警告は継続している。
 
 ---
+
+# Phase 3-3: ★4 怪獣(2026-08-28)
+
+## 実装内容
+
+- `Config.Kaiju`を追加し、`Config.Threat.Stages[4]`へ`Threshold=20000`、`Encounter="Kaiju"`を設定した。
+- `KaijuManager`を追加した。`ServerStorage.KaijuTemplate`を`Workspace.KaijuRuntime`へCloneし、
+  BoundingBoxから水中待機・浮上・旋回・海岸移動・上陸のPivotを導出する。怪獣は
+  `EnemyManager`へ登録せず、戦闘・HP・追跡・建物破壊を扱わない。
+- `MapRuntime`は`Metadata.KaijuSpawn` / `KaijuShorePoint`の座標値を`MapContext.kaijuPath`へ渡す。
+  `Config.Kaiju.Enabled=false`時は2つのmarkerを必須検証しないようにし、`KaijuManager`も経路を無効化する。
+- `ThreatManager`は★4昇格時にKaijuManagerを起動し、`GameManager`は次ラウンド先頭で
+  `KaijuManager.Clear()`をMap再生成より前に呼ぶ。
+
+## 検証結果
+
+- 対象Studioは`破壊する`、`PlaceId=109081398680442`。Play開始時のMapRuntimeログで固定MAPと
+  `KaijuSpawn (-595,1,380)` → `KaijuShorePoint (-595,1,250)`のMapContext設定を確認した。
+- 20000点をインメモリで設定した閾値プローブで、次の状態を順番に確認した:
+  `Waiting` → `Rising` → `Turning` → `Moving` → `Landing` → `Landed`。
+  `Landed`時のPivotは`(-595.0, 10.0, 250.0)`で、Outputにも`[ThreatManager] ★4 怪獣`と
+  `[KaijuManager] Landed`が出力された。
+- `KaijuManager.Clear()`直後に`Workspace.KaijuRuntime`と配下`Kaiju`が不在となり、遅延処理による再生成は無かった。
+- `rojo build default.project.json`成功。`git diff --check`成功(終了コード0)。
+- Place保存は行っていない。Play検証後は対象StudioをEdit状態へ戻した。
+
+## 未確認・申し送り
+
+- MCPの実行コンテキストから内部`RoundClock`/`Ready`を短絡できなかったため、RESULTの「次へ」から
+  自動的に次ラウンドへ遷移する一連の実機確認は未完了。`GameManager`の呼出し順と直接Clearの
+  ランタイム結果は確認済み。
+- `Config.Kaiju.Enabled=false`時の実Place切り分けはコードとRojo buildで確認したが、markerを外した
+  実StudioPlaceでの実行確認は未実施。
+- `KaijuTemplate`のHumanoid/Health属性はアセット固有値として残るが、怪獣コードからHP処理は呼ばない。
+# Phase 4-1: 怪獣モデル読込・海からの出現・移動基盤
+
+## 変更
+
+- `KaijuManager.lua`をBossSpawnベースへ拡張。Config指定モデルの安全なClone、BoundingBox基準の水中開始、Heartbeatによる出現、中心方向の直接移動、停止距離、世代管理、Clearを実装。
+- `Config.Kaiju`へ`SpawnMarkerName=Boss03`、`Intro.RiseDuration=7`、`Intro.PostRiseDelay=1`、`Intro.SubmergeRatio=1.1`、`Movement.Speed=6`、`Movement.StopDistance=8`、`ModelYawOffset=0`を追加。既存の旧設定キーは互換エイリアスとして保持。
+- 既存`MapRuntime`の`bossSpawnPoints`と`GameManager`の`SetMapContext`経路を利用。旧`kaijuPath`は既存dirty変更を保護するため互換経路として残すが、KaijuManagerはBossSpawnを優先する。
+- Phase 4-1の本番自動起動を避けるため、`Config.Kaiju.Enabled=false`を既定化。既存のStage 4定義は差し戻さず保持。
+
+## Studio検証
+
+- 対象はStudio `破壊する`、PlaceId `109081398680442`。GameManagerの実ラウンドで`MapContext設定完了: BossSpawn 3箇所 / center (69.4, -214.2)`を確認。
+- `ServerStorage.KaijuTemplate`: 15 BasePart、14 MeshPart、14 Motor6D、Bone 0、Script系0、BoundingBox約7.808 x 13.339 x 21.122、PrimaryPart `HumanoidRootPart`。
+- `Boss03`を選択し、Clone開始時はBoundingBox上端 `Y=-11.17`、2秒後 `Y=-5.63`、7.2秒後に完全出現 `maxY=16.84`、8.4秒後に`moving`を確認。開始時は海中に隠れ、頭から現れる配置になっている。
+- 移動は2.016秒で12.006 studs、実測5.956 studs/s。Pivotの水平Facingと中心方向の内積は1.0。
+- Speedを検証用に100へ一時変更した停止テストで、`idle`かつ中心距離7.9999988 studsを確認。ソース設定は6へ復元した。
+- `intro`中と`moving`中の両方で`Clear`を実行し、直後および2秒後に`Workspace.KaijuRuntime`が不在、旧callbackによる再生成なしを確認。Place保存、commit、公開は行っていない。
+
+## 未確認・申し送り
+
+- Studio Playの実ラウンドでGameManagerのMapContextログは確認済み。手動StartはMapContextを明示再設定した測定で安定確認済み。自動Stage 4接続は既定falseで未実行。
+- ★1〜★3、Bazooka、Airstrikeの個別戦闘回帰は今回のKaiju手動測定と同一Playで全面的には再実行していない。コンソールに既存のMapRuntime/Enemy/Clock起動ログを確認したが、回帰は限定的。
+- 検証用スニペットで一度、Runtime不存在時の直接参照エラーが出た。本番コードのエラーではなく、Play再起動後に安全な`FindFirstChild`版で再測定し、以後のKaiju測定は成功した。
+- Phase 4-2ではこの基盤へ火炎ブレス、360度尻尾回転を追加する。HP、被弾、撃破、FINAL PHASE、移動時建物破壊はさらに後続。

@@ -4,8 +4,8 @@
 -- 種別: Script(通常のサーバースクリプト)
 --
 -- ラウンド進行の司令塔。
--- ロビー(3秒・マップ生成) → バトル(120秒。敵撃破・建物全壊で増減) →
--- リザルト(「次へ」ボタンで手動進行。最大ResultTimeout秒) → 繰り返し。
+-- ロビー(3秒・マップ生成) → バトル(基礎時間。敵撃破・建物全壊で増減) →
+-- 条件付きFINAL(固定時間。怪獣撃破またはTIME UP) → リザルト(「次へ」ボタンで手動進行。最大ResultTimeout秒) → 繰り返し。
 -- RemoteEvent の自動生成と、各モジュールの初期化・接続もここで行う。
 --------------------------------------------------------------------
 
@@ -23,6 +23,7 @@ local VisualSetup = require(Modules.VisualSetup)
 local RoundClock = require(Modules.RoundClock)
 local EnemyManager = require(Modules.EnemyManager)
 local ThreatManager = require(Modules.ThreatManager)
+local KaijuManager = require(Modules.KaijuManager)
 
 -- ライティングと地形(Terrain草地)。ラウンドとは無関係に起動時1回だけ
 VisualSetup.Setup()
@@ -41,6 +42,104 @@ for _, name in Config.RemoteNames do
 end
 remotesFolder.Parent = ReplicatedStorage
 
+local roundState = "LOBBY"
+local finalPhaseStarted = false
+local finalPhaseResolved = false
+local finalResultReason = nil
+local finalResultAt = nil
+
+local function isActivePlayer(player)
+	return typeof(player) == "Instance" and player:IsA("Player") and player.Parent == Players
+end
+
+local function getFinalConfig()
+	return if typeof(Config.FinalPhase) == "table" then Config.FinalPhase else {}
+end
+
+local function awardFinalDefeatScore(attacker, remaining)
+	if not isActivePlayer(attacker) then
+		return
+	end
+
+	local finalConfig = getFinalConfig()
+	local scoreConfig = if typeof(finalConfig.Score) == "table" then finalConfig.Score else {}
+	local multiplier = tonumber(scoreConfig.DefeatMultiplier) or 1
+	local currentScore = WeaponServer.GetPlayerScore(attacker)
+	if multiplier > 1 and currentScore > 0 then
+		local targetScore = math.floor(currentScore * multiplier + 0.5)
+		local multiplierBonus = targetScore - currentScore
+		if multiplierBonus > 0 then
+			WeaponServer.AddScore(attacker, multiplierBonus, "kaijuMultiplier")
+		end
+	end
+
+	local timeBonusPerSecond = tonumber(scoreConfig.TimeBonusPerSecond) or 0
+	local wholeSeconds = math.max(math.floor(remaining + 0.5), 0)
+	local timeBonus = math.floor(wholeSeconds * math.max(timeBonusPerSecond, 0) + 0.5)
+	if timeBonus > 0 then
+		WeaponServer.AddScore(attacker, timeBonus, "kaijuTimeBonus")
+	end
+end
+
+-- FINALの終了入口。怪獣撃破とTIME UPが同時に来ても、最初の1回だけ確定する。
+local function resolveFinalPhase(reason, attacker)
+	if not finalPhaseStarted or finalPhaseResolved then
+		return false
+	end
+
+	-- 競合callbackがこの後に入っても再解決できないよう、最初に確定する。
+	finalPhaseResolved = true
+	finalResultReason = reason
+	local remaining = RoundClock.Remaining()
+	RoundClock.EndFinalPhase()
+
+	if reason == "defeated" then
+		-- KaijuManagerはこの通知前にDamage ScoreとDefeat Scoreを加算済み。
+		-- その合計へ倍率を適用し、Time Bonusには倍率を掛けない。
+		awardFinalDefeatScore(attacker, remaining)
+		local finalConfig = getFinalConfig()
+		local delay = math.max(tonumber(finalConfig.ResultDelayAfterDefeat) or 0, 0)
+		local health = if typeof(Config.Kaiju) == "table" then Config.Kaiju.Health else nil
+		local death = if health and typeof(health.Death) == "table" then health.Death else nil
+		local minimumDeathDelay = (tonumber(death and death.HoldDuration) or 0)
+			+ (tonumber(death and death.FadeDuration) or 0)
+		finalResultAt = os.clock() + math.max(delay, minimumDeathDelay)
+	else
+		-- TIME UPは撃破扱いにせず、KaijuのCombat/HP UI/Hitboxを即時無効化する。
+		KaijuManager.Clear()
+		finalResultAt = os.clock()
+	end
+	return true
+end
+
+-- ★4到達通知の受け口。ThreatManagerは敵政策だけを担当し、FINALの時計・怪獣・Resultは
+-- GameManagerが統括する。
+local function beginFinalPhase()
+	if finalPhaseStarted or finalPhaseResolved then
+		return false
+	end
+	finalPhaseStarted = true
+
+	local finalConfig = getFinalConfig()
+	local duration = math.max(tonumber(finalConfig.Duration) or 0, 0)
+	if not RoundClock.BeginFinalPhase(duration) then
+		warn("[GameManager] FINAL時計を開始できないためTIME UPとして終了します")
+		resolveFinalPhase("timeout")
+		return false
+	end
+
+	local kaijuStarted = KaijuManager.Start()
+	roundState = "FINAL"
+	remotes.RoundState:FireAllClients("FINAL", math.ceil(RoundClock.Remaining()))
+	remotes.Hud:FireAllClients("final", { duration = duration, kaijuStarted = kaijuStarted })
+	if not kaijuStarted then
+		warn("[GameManager] FINALの怪獣Spawnに失敗したためTIME UPとして終了します")
+		resolveFinalPhase("timeout")
+		return false
+	end
+	return true
+end
+
 --------------------------------------------------------------------
 -- モジュール初期化(お互いを直接 require させず、ここで依存を注入する)
 --------------------------------------------------------------------
@@ -49,7 +148,7 @@ DestructionManager.Init({
 	addScore = WeaponServer.AddScore,
 	addTime = RoundClock.Add, -- 全壊時のタイム報酬用(Step1で追加)
 	-- 爆風の影響を受けるモジュール群。Explode終了時に全員へctxがそのまま渡る。
-	blastListeners = { NPCManager.OnExplosion, EnemyManager.OnExplosion }, -- ★Step2で1要素追加
+	blastListeners = { NPCManager.OnExplosion, EnemyManager.OnExplosion, KaijuManager.OnExplosion },
 	effectRemote = remotes.Effect,
 	hudRemote = remotes.Hud,
 })
@@ -60,7 +159,8 @@ NPCManager.Init({
 RoundClock.Init({
 	-- タイムが動いた瞬間に即座にクライアントへ反映する(毎秒送信を待たない)
 	onChange = function(remaining, applied, reason, player)
-		remotes.RoundState:FireAllClients("BATTLE", math.ceil(remaining))
+		local state = if RoundClock.IsFinalPhase() then "FINAL" else "BATTLE"
+		remotes.RoundState:FireAllClients(state, math.ceil(remaining))
 
 		-- applied(実際に反映された秒数)が0のときは演出を出さない。
 		-- 0でも発火すると「増減していないのに数字が跳ねる」という嘘の演出になる
@@ -82,18 +182,29 @@ EnemyManager.Init({
 		ThreatManager.OnEnemyKilled(squadId, typeName)
 	end,
 })
+KaijuManager.Init({
+	addTime = RoundClock.Add,
+	explode = DestructionManager.Explode,
+	addScore = WeaponServer.AddScore,
+	hudRemote = remotes.Hud,
+	onDefeated = function(attacker)
+		resolveFinalPhase("defeated", attacker)
+	end,
+})
 ThreatManager.Init({
 	getScore = WeaponServer.GetTotalScore,
 	enemies = EnemyManager,
+	kaiju = KaijuManager,
 	hudRemote = remotes.Hud,
 	effectRemote = remotes.Effect,
+	onFinalReached = function()
+		beginFinalPhase()
+	end,
 })
 
 --------------------------------------------------------------------
 -- プレイヤーの入退室
 --------------------------------------------------------------------
-local roundState = "LOBBY"
-
 local function onPlayerAdded(player)
 	WeaponServer.SetupPlayer(player)
 
@@ -102,12 +213,14 @@ local function onPlayerAdded(player)
 	-- 手動進行(最大120秒)になり1回しか送らなくなったため、参加時点の状態を明示的に送る必要がある。
 	-- BATTLE中はRoundClockの実際の残り時間を、それ以外は0を送る(LOBBYは1秒以内に次の
 	-- 毎秒送信で上書きされる。RESULTはtimerLabelが固定文言のため数値を必要としない)
-	local timeLeft = if roundState == "BATTLE" then math.ceil(RoundClock.Remaining()) else 0
+	local timeLeft = if roundState == "BATTLE" or roundState == "FINAL"
+		then math.ceil(RoundClock.Remaining())
+		else 0
 	remotes.RoundState:FireClient(player, roundState, timeLeft)
 
 	-- リスポーン時、バトル中なら武器を配り直す(Backpackは死ぬと空になるため)
 	player.CharacterAdded:Connect(function()
-		if roundState == "BATTLE" then
+		if roundState == "BATTLE" or roundState == "FINAL" then
 			task.wait(0.5) -- Backpackの準備を待つ
 			WeaponServer.GiveTools(player)
 		end
@@ -137,14 +250,28 @@ local function runPhase(state, duration)
 	end
 end
 
--- BATTLEフェーズ専用: RoundClock(deadline方式)の残り時間が尽きるまで回す。
+-- BATTLE/FINALフェーズ専用: RoundClock(deadline方式)の残り時間、またはFINAL解決を待つ。
 -- runPhaseとは別関数にしているのは、LOBBYの固定長カウントダウンと
--- 動的に増減するBATTLEのカウントダウンを1つの関数に混ぜないため
+-- 動的に増減するBATTLE/FINALのカウントダウンを1つの関数に混ぜないため
 local function runBattlePhase()
 	roundState = "BATTLE"
-	while RoundClock.Remaining() > 0 do
-		remotes.RoundState:FireAllClients("BATTLE", math.ceil(RoundClock.Remaining()))
-		task.wait(1)
+	while true do
+		if finalPhaseResolved then
+			if finalResultAt and os.clock() >= finalResultAt then
+				return finalResultReason
+			end
+		elseif RoundClock.Remaining() <= 0 then
+			if finalPhaseStarted then
+				resolveFinalPhase("timeout")
+			else
+				return "timeout"
+			end
+		else
+			local state = if RoundClock.IsFinalPhase() then "FINAL" else "BATTLE"
+			roundState = state
+			remotes.RoundState:FireAllClients(state, math.ceil(RoundClock.Remaining()))
+		end
+		task.wait(0.2)
 	end
 end
 
@@ -188,14 +315,21 @@ task.wait(3) -- 起動直後のロード猶予
 while true do
 	-- 1) ロビー: 前ラウンドの後片付け → 固定MAPを原本から再ロード
 	roundState = "LOBBY"
+	finalPhaseStarted = false
+	finalPhaseResolved = false
+	finalResultReason = nil
+	finalResultAt = nil
+	RoundClock.EndFinalPhase()
 	WeaponServer.SetRoundActive(false)
 	WeaponServer.RemoveToolsFromAll()
 	NPCManager.Clear()
+	KaijuManager.Clear() -- 旧世代の移動を無効化し、前ラウンドのCloneをMAP再生成前に完全削除する
 	ThreatManager.Clear() -- ★Step2で追加(段階を0に戻す)
 	EnemyManager.Clear() -- ★Step2で追加(NPCManager.Clear()の隣。敵モデル・攻撃タイマー全消去)
 	DestructionManager.ClearAllDebris()
 	DestructionManager.ClearAllRubble()
 	local mapContext = MapRuntime.LoadRound()
+	KaijuManager.SetMapContext(mapContext) -- LoadRound直後に経路値をコピーし、後続Managerから独立させる
 	local buildings = mapContext.buildings
 	WeaponServer.SetMapContext(mapContext) -- boundsの数値だけをコピーし、エアストライクの地表面Raycastへ渡す
 	EnemyManager.SetMapContext(mapContext) -- 毎ラウンドCloneされた新しいMapContextを設定する
@@ -217,6 +351,11 @@ while true do
 	runBattlePhase()
 
 	-- 3) リザルト: 集計して全員に表示
+	if finalPhaseStarted then
+		-- 撃破時は死亡演出の待機時間を終えてから、残ったRuntimeを世代付きClearする。
+		-- TIME UPではresolveFinalPhase内ですでにClear済みだが、二重呼び出しも安全に扱える。
+		KaijuManager.Clear()
+	end
 	RoundClock.Stop() -- ★RESULT中にAddが呼ばれても何もしないようにする(事故防止)
 	ThreatManager.Stop() -- ★Step2で追加(内部でEnemyManager.SetAggressive(false)を呼ぶ)
 	WeaponServer.SetRoundActive(false)

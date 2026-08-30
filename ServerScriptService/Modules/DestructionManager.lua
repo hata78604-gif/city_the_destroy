@@ -354,6 +354,7 @@ local function tryRubbleify(part, ctx)
 	part.Material = RUBBLE_MATERIAL
 	part.Anchored = true
 	part.CanCollide = false
+	part.CanQuery = false
 	part.CastShadow = false
 
 	registerDestruction(part, ctx)

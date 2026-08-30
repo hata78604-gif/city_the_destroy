@@ -129,6 +129,83 @@ Config.Visual = {
 }
 
 -- ▼ ラウンド進行(秒) ------------------------------------------------
+-- Kaijuの元データ識別子。実行時はServerStorage.KaijuTemplateをCloneする。
+Config.Kaiju = {
+	Enabled = true, -- Phase 4-3Bで★4到達時の本番経路へ接続する。
+	Animations = {
+		Idle = "rbxassetid://125654140184351",
+		FireBreath = "rbxassetid://79039210156539",
+		Walk = "rbxassetid://107452436011504",
+	},
+	Combat = {
+		ThinkInterval = 0.25,
+		TailSpinRange = 30,
+		AttackCooldown = 2,
+	},
+	Health = {
+		-- Phase 4-3A temporary values; balance is intentionally deferred.
+		MaxHP = 100,
+		Damage = {
+			Bazooka = 10,
+			Airstrike = 5,
+		},
+		Score = {
+			PerHP = 50,
+			Defeat = 1000,
+		},
+		Death = {
+			HoldDuration = 2,
+			FadeDuration = 1,
+		},
+	},
+	Hitbox = {
+		SizeScale = Vector3.new(0.7, 0.9, 0.7),
+	},
+	FireBreath = {
+		Windup = 0.8,
+		ActiveDuration = 2.0,
+		Recovery = 0.4,
+		Range = 100,
+		Width = 20,
+		Height = 24,
+		PlayerPenalty = 5,
+		BuildingBlastRadius = 10,
+		BuildingBlastSpacing = 20,
+		MaxBuildingExplosions = 8,
+	},
+	TailSpin = {
+		Windup = 0.8,
+		SpinDuration = 1.2,
+		Radius = 30,
+		PlayerPenalty = 8,
+		BuildingBlastRadius = 24,
+	},
+	SpawnMarkerName = 'Boss03', -- 海側の既存BossSpawns。未指定時は名前順の先頭を使う。
+	ModelYawOffset = 0, -- Studio確認済み。怪獣モデルのローカル -Z が正面。
+	Intro = {
+		RiseDuration = 7,
+		PostRiseDelay = 1,
+		SubmergeRatio = 1.1, -- BoundingBox高さに対する開始深度倍率。モデル変更時もほぼ全身を海中に保つ。
+	},
+	Movement = {
+		Speed = 6,
+		StopDistance = 8,
+	},
+	TemplateName = "KaijuTemplate",
+	SourceAssetId = 93372820152503,
+	RootPartName = "HumanoidRootPart",
+	YawOffset = 0, -- Studio確認済み。怪獣モデルのローカル -Z が正面。
+	StartTopClearance = 2,
+	SubmergedWaitDuration = 1,
+	SwimFootDepth = 4,
+	VerticalOffset = 0,
+	RiseDuration = 7, -- 互換エイリアス。新経路はIntro.RiseDurationを優先する。
+	TurnDuration = 1.25,
+	MoveSpeed = 6, -- 互換エイリアス。新経路はMovement.Speedを優先する。
+	LandDuration = 1.5,
+	RuntimeFolderName = "KaijuRuntime",
+}
+
 Config.Round = {
 	LobbyTime = 3, -- ロビー待機(この間にマップ生成)
 	BattleTime = 300, -- 破壊タイム(基礎値。RoundClockがこれを起点に増減する)
@@ -139,6 +216,17 @@ Config.Round = {
 	-- 削除はせずコメントで明記して残す
 	ResultTime = 10,
 	ResultTimeout = 120, -- 「次へ」が押されなかった場合に自動でLOBBYへ進むまでの秒数(安全弁)
+}
+
+-- ▼ FINAL PHASE(★4怪獣戦) ------------------------------------------
+-- 数値は初期値。実プレイログで到達時間・撃破率を計測して後日調整する。
+Config.FinalPhase = {
+	Duration = 120,
+	Score = {
+		DefeatMultiplier = 1.5,
+		TimeBonusPerSecond = 100,
+	},
+	ResultDelayAfterDefeat = 3,
 }
 
 -- ▼ 破壊ブロック(破壊の最小単位) ------------------------------------
@@ -231,6 +319,7 @@ Config.Weapons = {
 	-- 短いと一方的に撃たれる時間ができる。街のタイルは124stud刻みなので、140なら
 	-- 「1か所に立つ→1区画を片付ける→次の交差点へ移る」というリズムになる
 	Bazooka = {
+		Enabled = true,
 		DisplayName = "バズーカ",
 		SlotKey = 1, -- キーボードの数字キー
 		Radius = 25, -- 爆発半径(stud)
@@ -243,6 +332,7 @@ Config.Weapons = {
 	-- 1入力あたりの破壊量を大きくしてクリック疲れを減らすのが狙いなので、
 	-- Cooldownが長い代わりに1回の威力が大きい
 	Airstrike = {
+		Enabled = true,
 		DisplayName = "エアストライク",
 		SlotKey = 2,
 		Radius = 25, -- 爆弾1発の爆発半径
@@ -267,6 +357,8 @@ Config.Weapons = {
 		PlaneParts = 5, -- 1機あたりのパーツ数(パーツ予算の見積り用。コードは参照しない)
 	},
 	RemoteBomb = {
+		-- 削除ではなく一時無効化。復活時はtrueへ戻すだけでよい。
+		Enabled = false,
 		DisplayName = "リモート爆弾",
 		SlotKey = 3,
 		Radius = 30, -- 起爆時の爆発半径(大爆発)
@@ -287,6 +379,13 @@ Config.Weapons = {
 	},
 }
 Config.WeaponOrder = { "Bazooka", "Airstrike", "RemoteBomb" }
+
+-- 武器の有効/無効は全利用側でこの判定を共有する。
+-- Enabled=nil は後方互換のため有効として扱い、false のときだけ無効にする。
+function Config.IsWeaponEnabled(weaponKey)
+	local weaponConfig = Config.Weapons[weaponKey]
+	return weaponConfig ~= nil and weaponConfig.Enabled ~= false
+end
 
 -- ▼ 破壊・瓦礫(上限と寿命は Config.Performance 側にある) ------------
 Config.Debris = {
@@ -603,6 +702,11 @@ Config.Threat = {
 			TimeReward = 0, -- 「敵は時間を配らない」の決着済み方針を維持
 
 			StandingRootOffset = 3, -- 屋根上面からTorso中心までの高さ。既存人型SpawnY=3と同じ体格
+			SupportCheckInterval = 0.2, -- 生存中Sniperの足元を確認する間隔(秒)
+			SupportCheckDistance = 1.5, -- 足元からこの距離以内にある支持面だけを立てる足場とみなす
+			RooftopSurfaceMaxGap = 12, -- markerから下がりすぎた建物内の床は屋上候補から除外する
+			FallTimeout = 4, -- 足場消失後、この時間を超えたら転落死として確定する
+			FallDistance = 200, -- 足場消失位置からこの距離を落下したら転落死として確定する
 			Parts = 6, -- パーツ予算の見積り用(コードは参照しない)
 			-- SpawnYは設定しない。spawnEnemy()はetype.SpawnYが無ければ呼び出し位置のYを使うため、
 			-- 屋上ごとに異なる高さ(roofTopY+StandingRootOffset)や地上フォールバックのYをそのまま使える
@@ -659,6 +763,14 @@ Config.Threat = {
 			Squad = {
 				{ type = "Tank", count = 2 },
 			},
+		},
+		{
+			Name = "★4 怪獣",
+			Threshold = 20000,
+			Telop = "怪獣が海から現れた！",
+			Sound = "Siren",
+			FinalPhase = true,
+			Encounter = "Kaiju",
 		},
 	},
 }

@@ -8,11 +8,19 @@
 --------------------------------------------------------------------
 
 local CollectionService = game:GetService("CollectionService")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local ServerStorage = game:GetService("ServerStorage")
+
+local Config = require(ReplicatedStorage:WaitForChild("Config"))
 
 local MapRuntime = {}
 
 local ROTATION_EPSILON = 0.0001
+
+local function isKaijuEnabled()
+	local kaijuConfig = Config.Kaiju
+	return typeof(kaijuConfig) ~= "table" or kaijuConfig.Enabled ~= false
+end
 
 local function requireChild(parent, name, className)
 	local child = parent:FindFirstChild(name)
@@ -243,7 +251,16 @@ end
 -- SniperSpawn markerは名前と足元接地面のワールド座標だけをMapContextへ公開する。
 -- configureMarkers=trueはClone後のラウンド用MAPにだけ使用し、Studio原本は変更しない。
 local function prepareSniperSpawnPoints(metadata, configureMarkers)
-	local sniperSpawns = requireChild(metadata, "SniperSpawns", "Folder")
+	local sniperSpawns = metadata:FindFirstChild("SniperSpawns")
+	if not sniperSpawns then
+		warn("[MapRuntime] Metadata.SniperSpawnsがないため、Sniperは地上フォールバックを使用します")
+		return {}
+	end
+	if not sniperSpawns:IsA("Folder") then
+		warn(("[MapRuntime] %sがFolderではないため、Sniperは地上フォールバックを使用します")
+			:format(sniperSpawns:GetFullName()))
+		return {}
+	end
 	local seenNames = {}
 	local markers = {}
 
@@ -272,7 +289,7 @@ local function prepareSniperSpawnPoints(metadata, configureMarkers)
 	end
 
 	if #markers == 0 then
-		error("[MapRuntime] SniperSpawns に有効なSpawn markerがありません")
+		warn("[MapRuntime] SniperSpawnsに有効なmarkerがないため、Sniperは地上フォールバックを使用します")
 	end
 
 	table.sort(markers, function(a, b)
@@ -365,6 +382,50 @@ local function prepareNPCSpawnPoints(metadata, configureMarkers)
 	return markers
 end
 
+-- Kaijuの登場経路はMetadata直下のBasePart 2点だけを参照し、
+-- MapContextにはInstanceを保持せず、座標値のコピーだけを渡す。
+local function prepareKaijuPath(metadata, configureMarkers)
+	local spawn = metadata:FindFirstChild("KaijuSpawn")
+	if not spawn then
+		error("[MapRuntime] Metadata.KaijuSpawn が見つかりません")
+	end
+	if not spawn:IsA("BasePart") then
+		error(("[MapRuntime] Metadata.KaijuSpawn はBasePartである必要があります (実際: %s)")
+			:format(spawn.ClassName))
+	end
+
+	local shore = metadata:FindFirstChild("KaijuShorePoint")
+	if not shore then
+		error("[MapRuntime] Metadata.KaijuShorePoint が見つかりません")
+	end
+	if not shore:IsA("BasePart") then
+		error(("[MapRuntime] Metadata.KaijuShorePoint はBasePartである必要があります (実際: %s)")
+			:format(shore.ClassName))
+	end
+
+	local spawnXZ = Vector3.new(spawn.Position.X, 0, spawn.Position.Z)
+	local shoreXZ = Vector3.new(shore.Position.X, 0, shore.Position.Z)
+	if (spawnXZ - shoreXZ).Magnitude <= ROTATION_EPSILON then
+		error("[MapRuntime] KaijuSpawnとKaijuShorePointのXZ座標は異なる必要があります")
+	end
+
+	if configureMarkers then
+		for _, marker in { spawn, shore } do
+			marker.Anchored = true
+			marker.CanCollide = false
+			marker.CanTouch = false
+			marker.CanQuery = false
+			marker.Transparency = 1
+		end
+	end
+
+	return {
+		spawnCFrame = spawn.CFrame,
+		spawnPosition = spawn.Position,
+		shorePosition = shore.Position,
+	}
+end
+
 -- Studioで明示されたLinksだけから、双方向の道路グラフを構築する。
 -- 距離による自動接続は行わず、ノード座標は道路表面のワールド座標をそのまま保持する。
 local function prepareRoadNetwork(metadata)
@@ -447,6 +508,9 @@ function MapRuntime.LoadRound()
 	prepareSniperSpawnPoints(templateMetadata, false)
 	prepareBossSpawnPoints(templateMetadata, false)
 	prepareNPCSpawnPoints(templateMetadata, false)
+	if isKaijuEnabled() then
+		prepareKaijuPath(templateMetadata, false)
+	end
 
 	-- 原本が正常であることを確認できた後でだけ、前ラウンドのMAPを削除する。
 	local oldMap = workspace:FindFirstChild("Map")
@@ -479,6 +543,7 @@ function MapRuntime.LoadRound()
 	local sniperSpawnPoints = prepareSniperSpawnPoints(metadata, true)
 	local bossSpawnPoints = prepareBossSpawnPoints(metadata, true)
 	local npcSpawnPoints = prepareNPCSpawnPoints(metadata, true)
+	local kaijuPath = if isKaijuEnabled() then prepareKaijuPath(metadata, true) else nil
 
 	local roadNodeCount = 0
 	for _ in roadNetwork.nodes do
@@ -497,6 +562,7 @@ function MapRuntime.LoadRound()
 		sniperSpawnPoints = sniperSpawnPoints,
 		bossSpawnPoints = bossSpawnPoints,
 		npcSpawnPoints = npcSpawnPoints,
+		kaijuPath = kaijuPath,
 		roadNetwork = roadNetwork,
 	}
 end

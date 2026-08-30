@@ -30,6 +30,9 @@ local SCORE_CATEGORY_LABELS = {
 	{ key = "buildingBonus", label = "全壊" },
 	{ key = "npc", label = "市民" },
 	{ key = "enemy", label = "敵" },
+	{ key = "kaiju", label = "怪獣" },
+	{ key = "kaijuMultiplier", label = "怪獣倍率" },
+	{ key = "kaijuTimeBonus", label = "残り時間Bonus" },
 }
 
 local remotes = nil -- RemoteEventのテーブル(GameManagerから受け取る)
@@ -153,6 +156,13 @@ function WeaponServer.GetTotalScore()
 		total += data.scoreValue.Value
 	end
 	return total
+end
+
+-- FINALの撃破倍率計算用。leaderstatsを直接書き換えず、既存AddScore()へ
+-- 差額だけを渡すために、現在値の読み取り口をWeaponServerに揃える。
+function WeaponServer.GetPlayerScore(player)
+	local data = player and playerData[player]
+	return data and data.scoreValue.Value or 0
 end
 
 --------------------------------------------------------------------
@@ -518,6 +528,9 @@ end
 
 local function placeBomb(player, data, root, targetPos)
 	local wc = Config.Weapons.RemoteBomb
+	if not Config.IsWeaponEnabled("RemoteBomb") then
+		return
+	end
 	if not isReady(data, "RemoteBomb") then
 		return
 	end
@@ -558,6 +571,9 @@ local function placeBomb(player, data, root, targetPos)
 end
 
 local function detonateBombs(player, data)
+	if not Config.IsWeaponEnabled("RemoteBomb") then
+		return
+	end
 	if #data.bombs == 0 then
 		return
 	end
@@ -605,7 +621,7 @@ local function onFire(player, weaponKey, targetPos)
 		return
 	end
 	-- 不正な引数をはじく
-	if typeof(weaponKey) ~= "string" or not Config.Weapons[weaponKey] then
+	if typeof(weaponKey) ~= "string" or not Config.IsWeaponEnabled(weaponKey) then
 		return
 	end
 	if typeof(targetPos) ~= "Vector3" or targetPos ~= targetPos then
@@ -631,6 +647,9 @@ local function onFire(player, weaponKey, targetPos)
 end
 
 local function onAction(player, action)
+	if action == "Detonate" and not Config.IsWeaponEnabled("RemoteBomb") then
+		return
+	end
 	local data = playerData[player]
 	if not data then
 		return
@@ -662,6 +681,9 @@ local function createToolTemplates()
 	toolFolder.Parent = ServerStorage
 
 	for _, key in Config.WeaponOrder do
+		if not Config.IsWeaponEnabled(key) then
+			continue
+		end
 		local wc = Config.Weapons[key]
 		local tool = Instance.new("Tool")
 		tool.Name = wc.DisplayName
@@ -681,12 +703,31 @@ local function createToolTemplates()
 	end
 end
 
+local function removeDisabledWeaponTools(player)
+	for _, container in { player:FindFirstChild("Backpack"), player.Character } do
+		if container then
+			for _, tool in container:GetChildren() do
+				if tool:IsA("Tool") then
+					local key = tool:GetAttribute("WeaponKey")
+					if Config.Weapons[key] and not Config.IsWeaponEnabled(key) then
+						tool:Destroy()
+					end
+				end
+			end
+		end
+	end
+end
+
 function WeaponServer.GiveTools(player)
 	local backpack = player:FindFirstChild("Backpack")
 	if not backpack then
 		return
 	end
+	removeDisabledWeaponTools(player)
 	for _, key in Config.WeaponOrder do
+		if not Config.IsWeaponEnabled(key) then
+			continue
+		end
 		-- すでに持っていたら配らない
 		local has = false
 		for _, container in { backpack, player.Character } do

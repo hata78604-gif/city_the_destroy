@@ -25,6 +25,7 @@ local camera = workspace.CurrentCamera
 local fxFolder = Instance.new("Folder")
 fxFolder.Name = "ClientFX"
 fxFolder.Parent = workspace
+local activeEnemyAimBeams = {}
 
 --------------------------------------------------------------------
 -- サウンド(3D位置つき再生。無効なIDでも止まらない)
@@ -253,6 +254,14 @@ end
 -- (テレグラフは頻繁に飛ぶので、後始末を怠るとPartが積み上がる)
 local function onEnemyAim(data)
 	local from, to, duration = data.from, data.to, data.duration
+	local aimKey = data.aimKey
+	if aimKey then
+		local previous = activeEnemyAimBeams[aimKey]
+		if previous then
+			activeEnemyAimBeams[aimKey] = nil
+			previous:Destroy()
+		end
+	end
 	local mid = (from + to) / 2
 	local dist = (to - from).Magnitude
 	local beam = Instance.new("Part")
@@ -265,11 +274,28 @@ local function onEnemyAim(data)
 	beam.CanQuery = false
 	beam.CastShadow = false
 	beam.Parent = fxFolder
+	if aimKey then
+		activeEnemyAimBeams[aimKey] = beam
+	end
 
 	TweenService:Create(beam, TweenInfo.new(duration), { Transparency = 1 }):Play()
 	task.delay(duration, function()
-		beam:Destroy()
+		if aimKey and activeEnemyAimBeams[aimKey] == beam then
+			activeEnemyAimBeams[aimKey] = nil
+		end
+		if beam.Parent then
+			beam:Destroy()
+		end
 	end)
+end
+
+local function onEnemyAimCancel(data)
+	local aimKey = data and data.aimKey
+	local beam = aimKey and activeEnemyAimBeams[aimKey]
+	if beam then
+		activeEnemyAimBeams[aimKey] = nil
+		beam:Destroy()
+	end
 end
 
 -- 兵士の機関銃曳光弾(Step5-1)。赤いenemyAimとは別の見た目(黄色系・細い・短時間)にすることで
@@ -383,6 +409,8 @@ effectRemote.OnClientEvent:Connect(function(effectType, data)
 		onEnemySpawn(data)
 	elseif effectType == "enemyAim" then
 		onEnemyAim(data)
+	elseif effectType == "enemyAimCancel" then
+		onEnemyAimCancel(data)
 	elseif effectType == "enemyTracer" then
 		onEnemyTracer(data)
 	elseif effectType == "enemyShotHit" then

@@ -17,6 +17,7 @@ local RoundClock = {}
 
 local deps = nil -- { onChange(remaining, applied, reason, player), maxLossPerMinute(number, 0=無効) }
 local running = false
+local finalPhase = false
 local endsAt = nil -- os.clock()基準の終了時刻。running=falseの間は無効
 
 -- 直近60秒あたりの最大損失キャップ用のログ。{ {at = os.clock(), amount = 失った秒数}, ... }
@@ -31,13 +32,37 @@ end
 function RoundClock.Start(base)
 	endsAt = os.clock() + base
 	running = true
+	finalPhase = false
 	lossLog = {} -- 前ラウンドの損失を持ち越さない(持ち越すと開始直後にキャップが発動する)
 	print(("[RoundClock] 開始(基礎 %d秒)"):format(base))
+end
+
+-- 通常BATTLEの時計をFINAL専用の時計へ切り替える。同じdeadlineを更新するだけで、
+-- 新しいtick loopは作らないため、BATTLE中のRoundClock利用者と競合しない。
+function RoundClock.BeginFinalPhase(duration)
+	if not running or typeof(duration) ~= "number" or duration ~= duration or duration < 0 then
+		return false
+	end
+	finalPhase = true
+	endsAt = os.clock() + duration
+	-- 通常BATTLE中の損失上限をFINALへ持ち越さない。FINALの時間減少は
+	-- KaijuのPenaltyだけを中央ゲートで許可する。
+	lossLog = {}
+	return true
+end
+
+function RoundClock.EndFinalPhase()
+	finalPhase = false
+end
+
+function RoundClock.IsFinalPhase()
+	return running and finalPhase
 end
 
 -- ラウンド終了。以降Add()は何もしない(LOBBY/RESULT中の事故防止)
 function RoundClock.Stop()
 	running = false
+	finalPhase = false
 	endsAt = nil
 end
 
@@ -53,6 +78,11 @@ end
 function RoundClock.Add(delta, reason, player)
 	if not running then
 		-- LOBBY/RESULT中や、ラウンド開始前に呼ばれても何もしない
+		return 0
+	end
+	if finalPhase and reason ~= "kaijuFireBreath" and reason ~= "kaijuTailSpin" then
+		-- FINALでは通常EnemyのPenalty/撃破報酬/建物全壊報酬を止め、
+		-- 怪獣攻撃だけを時間経済へ通す。
 		return 0
 	end
 

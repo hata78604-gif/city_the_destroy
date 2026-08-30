@@ -75,6 +75,9 @@ local function tryFire(targetPos)
 	if not key then
 		return
 	end
+	if not Config.IsWeaponEnabled(key) then
+		return
+	end
 	-- 連打防止の軽いゲート(本判定はサーバー側のクールダウン)。
 	-- 武器のCooldownより大きいと連射そのものを飲み込んでしまうため、Cooldownとの
 	-- 小さい方を使う(バズーカの0.3秒連射をこのゲートが呑み込まないように。Step4d)
@@ -103,7 +106,7 @@ local function startFiring(aimFn)
 	end
 	local key = tool:GetAttribute("WeaponKey")
 	local wc = key and Config.Weapons[key]
-	if not wc then
+	if not wc or not Config.IsWeaponEnabled(key) then
 		return
 	end
 	tryFire(aimFn())
@@ -176,6 +179,9 @@ local function findTool(key)
 end
 
 local function equipWeapon(key)
+	if not Config.IsWeaponEnabled(key) then
+		return
+	end
 	local char = player.Character
 	local humanoid = char and char:FindFirstChildOfClass("Humanoid")
 	if not humanoid then
@@ -243,15 +249,17 @@ player.CharacterAdded:Connect(onCharacter)
 player.CharacterRemoving:Connect(stopFiring)
 
 --------------------------------------------------------------------
--- キーボード入力(1/2/3 = 武器切替、F = 起爆)
+-- キーボード入力(有効武器のSlotKey = 武器切替、F = 起爆)
 --------------------------------------------------------------------
 -- Config の SlotKey(1〜3)をキーコードに対応付ける
 local SLOT_KEYCODES = { Enum.KeyCode.One, Enum.KeyCode.Two, Enum.KeyCode.Three }
 local keyToWeapon = {}
 for _, weaponKey in Config.WeaponOrder do
-	local slot = Config.Weapons[weaponKey].SlotKey
-	if SLOT_KEYCODES[slot] then
-		keyToWeapon[SLOT_KEYCODES[slot]] = weaponKey
+	if Config.IsWeaponEnabled(weaponKey) then
+		local slot = Config.Weapons[weaponKey].SlotKey
+		if SLOT_KEYCODES[slot] then
+			keyToWeapon[SLOT_KEYCODES[slot]] = weaponKey
+		end
 	end
 end
 
@@ -261,7 +269,7 @@ UserInputService.InputBegan:Connect(function(input, processed)
 	end
 	if keyToWeapon[input.KeyCode] then
 		equipWeapon(keyToWeapon[input.KeyCode])
-	elseif input.KeyCode == Enum.KeyCode.F then
+	elseif input.KeyCode == Enum.KeyCode.F and Config.IsWeaponEnabled("RemoteBomb") then
 		actionRemote:FireServer("Detonate")
 	end
 end)
@@ -271,5 +279,7 @@ end)
 --------------------------------------------------------------------
 events.EquipRequest.Event:Connect(equipWeapon)
 events.DetonateRequest.Event:Connect(function()
-	actionRemote:FireServer("Detonate")
+	if Config.IsWeaponEnabled("RemoteBomb") then
+		actionRemote:FireServer("Detonate")
+	end
 end)

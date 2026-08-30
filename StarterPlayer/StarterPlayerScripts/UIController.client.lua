@@ -115,6 +115,60 @@ local threatLabel = makeLabel(hud, {
 local threatScale = Instance.new("UIScale")
 threatScale.Parent = threatLabel
 
+-- 怪獣HP(サーバーから受け取った値だけを表示する。入力を吸わないよう全要素Active=false)
+local kaijuHpFrame = Instance.new("Frame")
+kaijuHpFrame.Name = "KaijuHP"
+kaijuHpFrame.AnchorPoint = Vector2.new(0.5, 0)
+kaijuHpFrame.Position = UDim2.new(0.5, 0, 0, 88)
+kaijuHpFrame.Size = UDim2.fromOffset(360, 58)
+kaijuHpFrame.BackgroundColor3 = Color3.fromRGB(20, 20, 25)
+kaijuHpFrame.BackgroundTransparency = 0.25
+kaijuHpFrame.BorderSizePixel = 0
+kaijuHpFrame.Visible = false
+kaijuHpFrame.Active = false
+kaijuHpFrame.Parent = hud
+local kaijuHpCorner = Instance.new("UICorner")
+kaijuHpCorner.CornerRadius = UDim.new(0, 8)
+kaijuHpCorner.Parent = kaijuHpFrame
+
+local kaijuHpTitle = makeLabel(kaijuHpFrame, {
+	Position = UDim2.fromOffset(10, 3),
+	Size = UDim2.fromOffset(120, 22),
+	Text = "KAIJU",
+	TextColor3 = Color3.fromRGB(255, 220, 80),
+	TextXAlignment = Enum.TextXAlignment.Left,
+	Active = false,
+})
+local kaijuHpValue = makeLabel(kaijuHpFrame, {
+	AnchorPoint = Vector2.new(1, 0),
+	Position = UDim2.new(1, -10, 0, 3),
+	Size = UDim2.fromOffset(150, 22),
+	Text = "0 / 0",
+	TextXAlignment = Enum.TextXAlignment.Right,
+	Active = false,
+})
+
+local kaijuHpBarBack = Instance.new("Frame")
+kaijuHpBarBack.Position = UDim2.fromOffset(10, 32)
+kaijuHpBarBack.Size = UDim2.new(1, -20, 0, 16)
+kaijuHpBarBack.BackgroundColor3 = Color3.fromRGB(70, 25, 25)
+kaijuHpBarBack.BorderSizePixel = 0
+kaijuHpBarBack.Active = false
+kaijuHpBarBack.Parent = kaijuHpFrame
+local kaijuHpBarCorner = Instance.new("UICorner")
+kaijuHpBarCorner.CornerRadius = UDim.new(0, 6)
+kaijuHpBarCorner.Parent = kaijuHpBarBack
+
+local kaijuHpFill = Instance.new("Frame")
+kaijuHpFill.Size = UDim2.fromScale(1, 1)
+kaijuHpFill.BackgroundColor3 = Color3.fromRGB(220, 55, 55)
+kaijuHpFill.BorderSizePixel = 0
+kaijuHpFill.Active = false
+kaijuHpFill.Parent = kaijuHpBarBack
+local kaijuHpFillCorner = Instance.new("UICorner")
+kaijuHpFillCorner.CornerRadius = UDim.new(0, 6)
+kaijuHpFillCorner.Parent = kaijuHpFill
+
 -- 自分のスコア(右上)
 -- 標準プレイヤーリスト(leaderstatsの「スコア」)も右上に出るため、
 -- 重ならないようリスト幅ぶん左にずらして配置する
@@ -274,6 +328,9 @@ local slots = {} -- [weaponKey] = { button, overlay, cdText, stroke, sub }
 
 for _, key in Config.WeaponOrder do
 	local wc = Config.Weapons[key]
+	if not Config.IsWeaponEnabled(key) then
+		continue
+	end
 
 	local button = Instance.new("TextButton")
 	button.Size = UDim2.fromOffset(90, 90)
@@ -383,7 +440,9 @@ local detonateBtn = makeActionButton("起爆",
 	UDim2.new(1, -20, 1, -130), UDim2.fromOffset(100, 60), Color3.fromRGB(200, 60, 40))
 detonateBtn.Visible = false
 detonateBtn.Activated:Connect(function()
-	weaponEvents.DetonateRequest:Fire()
+	if Config.IsWeaponEnabled("RemoteBomb") then
+		weaponEvents.DetonateRequest:Fire()
+	end
 end)
 
 --------------------------------------------------------------------
@@ -718,6 +777,20 @@ local function flashDamageVignette()
 	TweenService:Create(damageVignette, TweenInfo.new(0.35), { BackgroundTransparency = 1 }):Play()
 end
 
+local function updateKaijuHP(data)
+	if typeof(data) ~= "table" then
+		return
+	end
+	local maxHP = math.max(tonumber(data.maxHP) or 0, 0)
+	local currentHP = math.clamp(tonumber(data.currentHP) or 0, 0, maxHP)
+	local visible = data.visible == true and maxHP > 0
+	kaijuHpFrame.Visible = visible
+	kaijuHpValue.Text = ("%d / %d"):format(
+		math.floor(currentHP + 0.5),
+		math.floor(maxHP + 0.5))
+	kaijuHpFill.Size = UDim2.fromScale(if maxHP > 0 then currentHP / maxHP else 0, 1)
+end
+
 --------------------------------------------------------------------
 -- 脅威演出(Step2: ★1警官)。ここより上のタイム経済演出(flashTimer等)は変更しない
 --------------------------------------------------------------------
@@ -837,8 +910,13 @@ end
 -- ラウンド状態と残り時間
 local lastState = nil
 remotes:WaitForChild("RoundState").OnClientEvent:Connect(function(state, timeLeft)
+	if state == "LOBBY" or state == "RESULT" then
+		kaijuHpFrame.Visible = false
+	end
 	if state == "BATTLE" then
 		timerLabel.Text = ("%d:%02d"):format(timeLeft // 60, timeLeft % 60)
+	elseif state == "FINAL" then
+		timerLabel.Text = ("FINAL %d:%02d"):format(timeLeft // 60, timeLeft % 60)
 	elseif state == "LOBBY" then
 		timerLabel.Text = ("開始まで %d"):format(timeLeft)
 	else
@@ -853,6 +931,8 @@ remotes:WaitForChild("RoundState").OnClientEvent:Connect(function(state, timeLef
 			showTelop("まもなく開始…", 4)
 		elseif state == "BATTLE" then
 			showTelop("破壊せよ!", 2.5)
+		elseif state == "FINAL" then
+			showTelop("FINAL PHASE  KAIJU", 3)
 		elseif state == "RESULT" then
 			showTelop("終了!", 2.5)
 		end
@@ -883,7 +963,13 @@ remotes:WaitForChild("Hud").OnClientEvent:Connect(function(kind, data)
 	elseif kind == "notice" then
 		showNotice(data.text)
 	elseif kind == "chain" then
-		showChain(data.mult)
+		if Config.IsWeaponEnabled("RemoteBomb") then
+			showChain(data.mult)
+		end
+	elseif kind == "kaijuHP" then
+		updateKaijuHP(data)
+	elseif kind == "final" then
+		showTelop("FINAL PHASE  KAIJU", 3)
 	end
 end)
 
@@ -915,6 +1001,10 @@ end)
 
 -- リモート爆弾の設置数(スロットのサブ表示 + 起爆ボタンの表示切替)
 remotes:WaitForChild("BombCount").OnClientEvent:Connect(function(count)
+	if not Config.IsWeaponEnabled("RemoteBomb") then
+		detonateBtn.Visible = false
+		return
+	end
 	local slot = slots.RemoteBomb
 	if slot then
 		slot.sub.Text = if count > 0

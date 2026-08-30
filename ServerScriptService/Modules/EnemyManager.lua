@@ -34,6 +34,7 @@ local enemies = {} -- enemies[model] = enemyState(生存中のみ)
 local playerState = {} -- playerState[player] = { invincibleUntil }
 local killCounts = {} -- killCounts[player] = number(倒した敵の合計数。種類は問わない)
 local aggressive = false -- ThreatManager.Start/Stopで切り替わる(移動・攻撃の可否)
+local finalPhase = false -- FINAL開始後は新規敵・未完了の増援だけを止め、既存個体は残す
 local roundToken = 0 -- Clear()のたびに+1。task.delayコールバックの世代確認に使う
 local currentMap = nil -- SetMapContextで受け取った、そのラウンドのworkspace.Map
 local spawnPoints = {} -- MapContext.enemySpawnPointsのVector3コピー。marker Instanceは保持しない
@@ -48,11 +49,15 @@ local occupiedSniperSpawns = {} -- [spawnName]=true。生成予約中と生存�
 -- spawnEnemy/DeploySquadの両方で防ぐ。Clear()でリセットしないと次ラウンドでsquadIdが
 -- 再利用されたときに誤って撤退済み扱いになる
 local retiredSquads = {}
+local nextSniperAimId = 0
 
 -- 撤退中の地上個体(Step5-2)。retreatingEnemies[model] = { model, core, dir, startedAt }。
 -- enemiesテーブルからは既に外れている(CountAlive/OnExplosion/攻撃/被弾の対象外にするため)。
 -- Heartbeatでaggressiveに関係なく毎フレーム更新し、街外周を抜けたらDestroyする
 local retreatingEnemies = {}
+-- 足場を失ったSniperは通常のenemiesから外し、落下演出だけを別管理する。
+-- alive=falseにするのと同時に攻撃・爆発判定・squad生存数から除外する。
+local fallingSnipers = {}
 
 -- ヘリ輸送(Step5-1)。squadId=>まだ地上にいないが派遣中の数。CountAliveに加算することで
 -- 「ヘリ飛行中は生存0体」の誤判定(全滅済みと誤認されて余分な再派遣が起きる)を防ぐ
@@ -66,6 +71,13 @@ local warnedRigTemplateIssues = {}
 local modelTemplates = {} -- ServerStorage.EnemyModelsから検証済みの汎用Modelテンプレート
 local warnedModelTemplateIssues = {}
 local warnedModelFallbacks = {}
+
+local sniperConfig = Config.Threat.EnemyTypes.Sniper or {}
+local SNIPER_SUPPORT_CHECK_INTERVAL = sniperConfig.SupportCheckInterval or 0.2
+local SNIPER_SUPPORT_CHECK_DISTANCE = sniperConfig.SupportCheckDistance or 1.5
+local SNIPER_ROOFTOP_SURFACE_MAX_GAP = sniperConfig.RooftopSurfaceMaxGap or 12
+local SNIPER_FALL_TIMEOUT = sniperConfig.FallTimeout or 4
+local SNIPER_FALL_DISTANCE = sniperConfig.FallDistance or 200
 
 local THINK_INTERVAL = 0.2 -- 標的の再選択・攻撃判定を行う頻度(移動自体は毎フレーム)
 
@@ -486,16 +498,78 @@ end
 -- R15 HumanoidはHipHeightを使って足裏を合わせ、現在の軽量リグなど
 -- Humanoidを持たないモデルはBoundingBox下端を地面へ合わせる。
 -- 現在の固定MAPだけを対象に、指定XZ直下の表面Yを返す。EnemySpawn marker自身はCanQuery=falseなのでヒットしない。
-local function findGroundSurfaceY(position)
+local function getBuildingIdFromAncestor(instance)
+	local current = instance
+	while current and current ~= currentMap do
+		local buildingId = current:GetAttribute("BuildingId")
+		if buildingId ~= nil then
+			return buildingId
+		end
+		current = current.Parent
+	end
+	return nil
+end
+
+-- Map内の実際に立てる面だけを返す。Debris/瓦礫/markerはCanQueryまたはCanCollideで除外する。
+-- requireGround=trueの場合は建物の破壊可能Partを地上フォールバック候補にしない。
+local function raycastMapSurface(position, options)
 	if not currentMap then
 		return nil
 	end
+	options = options or {}
+
 	local params = RaycastParams.new()
 	params.FilterType = Enum.RaycastFilterType.Include
-	params.FilterDescendantsInstances = { currentMap }
-	local origin = Vector3.new(position.X, position.Y + 200, position.Z)
-	local result = workspace:Raycast(origin, Vector3.new(0, -500, 0), params)
-	return result and result.Position.Y or nil
+	local filter = { currentMap }
+	if workspace.Terrain then
+		table.insert(filter, workspace.Terrain)
+	end
+	params.FilterDescendantsInstances = filter
+	params.IgnoreWater = true
+
+	local originY = options.originY or (position.Y + 200)
+	local maxDistance = options.maxDistance or 500
+	local result = workspace:Raycast(
+		Vector3.new(position.X, originY, position.Z),
+		Vector3.new(0, -maxDistance, 0),
+		params)
+	if not result then
+		return nil
+	end
+
+	local instance = result.Instance
+	if instance == workspace.Terrain then
+		if options.requireBuilding then
+			return nil
+		end
+		return { position = result.Position, instance = instance }
+	end
+	if not instance:IsA("BasePart")
+		or not instance.CanCollide
+		or (options.rejectTransparent and instance.Transparency >= 1)
+		or CollectionService:HasTag(instance, "Debris") then
+		return nil
+	end
+
+	local buildingId = getBuildingIdFromAncestor(instance)
+	if options.requireBuilding and buildingId == nil then
+		return nil
+	end
+	if options.requireGround
+		and (buildingId ~= nil or CollectionService:HasTag(instance, "Destructible")) then
+		return nil
+	end
+
+	return {
+		position = result.Position,
+		instance = instance,
+		buildingId = buildingId,
+	}
+end
+
+local function findGroundSurfaceY(position)
+	local surface = raycastMapSurface(position)
+	return surface and surface.position.Y or nil
 end
 
 local function alignModelFeetToGround(model, groundY)
@@ -538,7 +612,7 @@ end
 --   alignToGround=true }。alignToGroundは固定MAPのspawn markerを地面の表面として扱う。
 -- 省略時(第4引数なし)は既存呼び出しと完全に同じ挙動を維持する
 local function spawnEnemy(typeName, position, squadId, options)
-	if systemDisabled then
+	if systemDisabled or finalPhase then
 		return nil
 	end
 	-- 撤退済み部隊からの新規生成を防ぐ最終防衛線(Step5-0)。DeploySquad/deployFromCarの
@@ -619,7 +693,10 @@ local function spawnEnemy(typeName, position, squadId, options)
 	model.PrimaryPart = core
 	local groundY = position.Y
 	if alignToGround then
-		groundY = findGroundSurfaceY(position) or position.Y
+		local configuredGroundY = options and options.groundSurfaceY
+		groundY = if typeof(configuredGroundY) == "number"
+			then configuredGroundY
+			else (findGroundSurfaceY(position) or position.Y)
 		alignModelFeetToGround(model, groundY)
 		y = core.Position.Y
 	end
@@ -665,6 +742,12 @@ local function spawnEnemy(typeName, position, squadId, options)
 		hitFlash.Parent = model
 	end
 
+	local sniperAimKey = nil
+	if typeName == "Sniper" then
+		nextSniperAimId += 1
+		sniperAimKey = ("%d:%d"):format(roundToken, nextSniperAimId)
+	end
+
 	local enemy = {
 		model = model,
 		core = core,
@@ -688,6 +771,9 @@ local function spawnEnemy(typeName, position, squadId, options)
 		-- RoadNodeは道路表面座標なので、車両Rootと接地面の差だけを移動時に加える。
 		groundOffsetY = if alignToGround then y - groundY else 0,
 		sniperSpawnName = options and options.sniperSpawnName or nil,
+		sniperPlacement = options and options.sniperPlacement or nil,
+		sniperAimKey = sniperAimKey,
+		nextSupportCheck = if typeName == "Sniper" then os.clock() else math.huge,
 		-- 降車ロジック(手順5)用。Body/Movementで分岐させず全タイプに持たせる(非対象タイプでは無害に未使用のまま)
 		spawnedAt = os.clock(),
 		tripsUsed = 0,
@@ -942,7 +1028,7 @@ local function resolveSniperShot(enemy, targetPlayer, origin, direction, token)
 	if roundToken ~= token then
 		return -- ラウンドが終わっていたら何もしない
 	end
-	if not enemy.alive or not aggressive then
+	if not enemy.alive or enemy.falling or not aggressive then
 		return
 	end
 	if enemy.model:GetAttribute("Retreating") then
@@ -972,6 +1058,9 @@ end
 -- 予告開始。origin/direction/rayEndをここで確定し、以後2秒間(Telegraph)変更しない。
 -- 赤い予告線は既存enemyAimをそのまま使う(duration=Telegraphなので予告終了と同時に消える)
 local function fireSniper(enemy, targetPlayer, targetRoot)
+	if not enemy.alive or enemy.falling then
+		return
+	end
 	local etype = enemy.etype
 	local token = roundToken
 	local origin = enemy.markerAnchor.Position
@@ -982,6 +1071,7 @@ local function fireSniper(enemy, targetPlayer, targetRoot)
 		from = origin,
 		to = rayEnd, -- プレイヤー位置ではなく500stud先の固定点で線を終わらせる
 		duration = etype.Telegraph,
+		aimKey = enemy.sniperAimKey,
 	})
 
 	task.delay(etype.Telegraph, function()
@@ -1110,6 +1200,174 @@ local function maintainStandingY(enemy)
 	end
 end
 
+local function getModelFeetY(model)
+	if not model or not model.Parent then
+		return nil
+	end
+
+	-- R15のBoundingBoxには武器や装備の下端が含まれることがあり、実際の足元より
+	-- 下にずれる。足場判定は、接地に使うFootの下端を優先する。
+	local humanoid = model:FindFirstChildOfClass("Humanoid")
+	if humanoid and humanoid.RigType == Enum.HumanoidRigType.R15 then
+		local lowestFootY = math.huge
+		for _, footName in { "LeftFoot", "RightFoot" } do
+			local foot = model:FindFirstChild(footName, true)
+			if foot and foot:IsA("BasePart") then
+				lowestFootY = math.min(lowestFootY, foot.Position.Y - foot.Size.Y * 0.5)
+			end
+		end
+		if lowestFootY < math.huge then
+			return lowestFootY
+		end
+	end
+
+	local boundingBoxCf, boundingBoxSize = model:GetBoundingBox()
+	return boundingBoxCf.Position.Y - boundingBoxSize.Y * 0.5
+end
+
+local function hasSniperSupport(enemy)
+	local feetY = getModelFeetY(enemy.model)
+	if not feetY then
+		return false
+	end
+
+	local support = raycastMapSurface(
+		Vector3.new(enemy.core.Position.X, feetY, enemy.core.Position.Z),
+		{
+			originY = feetY + 0.5,
+			maxDistance = SNIPER_SUPPORT_CHECK_DISTANCE + 0.5,
+			rejectTransparent = true,
+		})
+	if not support then
+		return false
+	end
+
+	local gap = feetY - support.position.Y
+	return gap >= -0.75 and gap <= SNIPER_SUPPORT_CHECK_DISTANCE
+end
+
+local function disableRigAntiGravity(enemy)
+	if not enemy.core then
+		return
+	end
+	local attachment = enemy.core:FindFirstChild("EnemyAntiGravityAttachment")
+	local force = attachment and attachment:FindFirstChild("EnemyAntiGravity")
+	if force and force:IsA("VectorForce") then
+		force.Force = Vector3.zero
+		pcall(function()
+			force.Enabled = false
+		end)
+	end
+end
+
+local function cancelSniperAim(enemy)
+	if enemy
+		and enemy.sniperAimKey
+		and deps
+		and deps.effectRemote then
+		deps.effectRemote:FireAllClients("enemyAimCancel", { aimKey = enemy.sniperAimKey })
+	end
+end
+
+local function finalizeFallingSniper(record)
+	if record.finalized then
+		return
+	end
+	record.finalized = true
+	local enemy = record.enemy
+	local model = enemy.model
+	fallingSnipers[model] = nil
+	if model.Parent then
+		model:Destroy()
+	end
+
+	-- 転落はプレイヤーの攻撃による撃破ではないため、スコア/killCountsは増やさない。
+	-- ただし通常撃破と同じ通知経路を通し、将来のIndividualRespawn等の判定は壊さない。
+	if deps and deps.onEnemyKilled then
+		deps.onEnemyKilled(enemy.squadId, enemy.typeName)
+	end
+end
+
+local function beginSniperFall(enemy)
+	if not enemy.alive or enemy.falling then
+		return
+	end
+
+	local model = enemy.model
+	enemy.alive = false
+	enemy.falling = true
+	enemy.nextAttack = math.huge
+	enemy.nextSupportCheck = math.huge
+	enemy.target = nil
+	releaseSniperSpawn(enemy)
+
+	model:SetAttribute("Falling", true)
+	model:SetAttribute("Dead", true)
+	if enemy.marker then
+		enemy.marker.Enabled = false
+	end
+	if enemy.hitFlash then
+		enemy.hitFlash.Enabled = false
+	end
+	cancelSniperAim(enemy)
+
+	-- R15 rigは通常時に反重力VectorForceで固定されているため、転落時だけ無効化する。
+	if enemy.isRig then
+		disableRigAntiGravity(enemy)
+		setRigQueryEnabled(model, false)
+		pcall(function()
+			enemy.core:SetNetworkOwner(nil)
+		end)
+	end
+	forEachModelBasePart(model, function(part)
+		part.Anchored = false
+		part.CanCollide = false
+		part.CanTouch = false
+		part.CanQuery = false
+	end)
+	enemy.core.AssemblyLinearVelocity = Vector3.new(0, -2, 0)
+	enemy.core.AssemblyAngularVelocity = Vector3.zero
+
+	-- ここで通常の敵一覧から除外するので、CountAlive/OnExplosion/攻撃更新の対象にならない。
+	enemies[model] = nil
+	fallingSnipers[model] = {
+		enemy = enemy,
+		startedAt = os.clock(),
+		startY = enemy.core.Position.Y,
+		lastPosition = enemy.core.Position,
+	}
+end
+
+local function updateFallingSniper(record)
+	local enemy = record.enemy
+	local model = enemy.model
+	if not model.Parent then
+		fallingSnipers[model] = nil
+		return
+	end
+
+	record.lastPosition = enemy.core.Position
+	local elapsed = os.clock() - record.startedAt
+	local feetY = getModelFeetY(model)
+	local reachedSurface = false
+	if feetY then
+		local surface = raycastMapSurface(
+			Vector3.new(enemy.core.Position.X, feetY, enemy.core.Position.Z),
+			{
+				originY = feetY + 0.75,
+				maxDistance = SNIPER_FALL_DISTANCE + 1,
+				rejectTransparent = true,
+			})
+		reachedSurface = surface ~= nil and feetY <= surface.position.Y + 0.75
+	end
+
+	if reachedSurface
+		or elapsed >= SNIPER_FALL_TIMEOUT
+		or record.startY - enemy.core.Position.Y >= SNIPER_FALL_DISTANCE then
+		finalizeFallingSniper(record)
+	end
+end
+
 -- Movement=="direct"(直進)の敵の移動・攻撃。既存ロジックは無変更(リネームのみ)
 local function updateDirectEnemy(enemy, dt)
 	local now = os.clock()
@@ -1161,6 +1419,13 @@ end
 -- Movement=="stationary"(静止。Step5-2)の敵の攻撃のみ。屋上・地上どちらでも位置を一切変えない
 local function updateStationaryEnemy(enemy, _dt)
 	local now = os.clock()
+	if enemy.typeName == "Sniper" and now >= (enemy.nextSupportCheck or 0) then
+		enemy.nextSupportCheck = now + SNIPER_SUPPORT_CHECK_INTERVAL
+		if not hasSniperSupport(enemy) then
+			beginSniperFall(enemy)
+			return
+		end
+	end
 	if now >= enemy.nextThink then
 		enemy.nextThink = now + THINK_INTERVAL
 		enemy.target = pickTarget(enemy)
@@ -1630,6 +1895,14 @@ RunService.Heartbeat:Connect(function(dt)
 	end
 	-- 撤退中の地上個体(Step5-2)はaggressiveに関係なく毎フレーム更新する(仕様どおり)。
 	-- ラウンド終了(SetAggressive(false))後も撤退移動自体は止めず、街外周へ抜けさせてから消す
+	-- 転落中のSniperはaggressive=falseでも地面到達/タイムアウトまで後始末を続ける。
+	for model, record in fallingSnipers do
+		if model.Parent then
+			updateFallingSniper(record)
+		else
+			fallingSnipers[model] = nil
+		end
+	end
 	for model, record in retreatingEnemies do
 		if model.Parent then
 			updateRetreatingEnemy(model, record, dt)
@@ -1646,6 +1919,7 @@ local function killEnemy(enemy, ctx)
 	if not enemy.alive then
 		return
 	end
+	cancelSniperAim(enemy)
 	enemy.alive = false
 	releaseSniperSpawn(enemy) -- 死体が残る6秒間もSpawn地点は再利用可能
 	enemy.model:SetAttribute("Dead", true)
@@ -1890,8 +2164,7 @@ function EnemyManager.SetMapContext(context)
 		})
 	end
 	if #sniperSpawnPoints == 0 then
-		warn("[EnemyManager] MapContext.sniperSpawnPointsが空です。敵システムを無効化します")
-		return
+		warn("[EnemyManager] 有効なSniperSpawnがないため、Sniperは地上フォールバックを使用します")
 	end
 
 	local contextRoadNetwork = context.roadNetwork
@@ -1996,6 +2269,7 @@ local function canContinueTransport(model, transport, token)
 	return not transport.cancelled
 		and roundToken == token
 		and aggressive
+		and not finalPhase
 		and not retiredSquads[transport.squadId]
 		and model.Parent ~= nil
 end
@@ -2064,90 +2338,143 @@ local function decrementPending(squadId)
 	end
 end
 
--- 現在workspace.Mapに残っているBuildingId付きBasePartから、棟(BuildingId)ごとの屋上候補を集める
--- (Step5-2)。CityGeneratorには手を入れず、破壊で減った後の残存パーツだけを見る。
--- 候補は各棟の最高部(topY = Position.Y + Size.Y/2)1つに絞り、dropPointに近い順に並べて返す。
--- 切妻屋根(Step V-1)の建物は斜面の頂点にスナイパーが立つと破綻するため除外する:
--- CityGeneratorが建物のModelに付ける HasGableRoof 属性を、そのパーツの親(=建物のModel。
--- グリッドモードの手続き生成建物ではブロックは必ずそのbuildingのModel直下に置かれる)で確認する。
--- 戻り値の各要素: { x, z, topY, dist }
-local function _findLegacyRooftopCandidates(dropPoint)
-	local map = currentMap
-	if not map then
-		return {}
-	end
-	local best = {} -- best[buildingId] = { x, z, topY }
-	for _, part in map:GetDescendants() do
-		if part:IsA("BasePart") then
-			local buildingId = part:GetAttribute("BuildingId")
-			if buildingId and not (part.Parent and part.Parent:GetAttribute("HasGableRoof")) then
-				local topY = part.Position.Y + part.Size.Y / 2
-				local current = best[buildingId]
-				if not current or topY > current.topY then
-					best[buildingId] = { x = part.Position.X, z = part.Position.Z, topY = topY }
+-- 固定MAPのSniperSpawn markerごとに、現在も建物の支持面が残っているかを確認する。
+-- BuildingId付きBasePart全走査は透明Partや建物フォルダ内の車両まで候補にし得るため、
+-- 実際に設計されたmarkerと、その直下のRaycast結果だけを候補として扱う。
+local function findRooftopCandidates(dropPoint)
+	local candidates = {}
+	local flatDrop = dropPoint and Vector3.new(dropPoint.X, 0, dropPoint.Z)
+
+	for _, spawnPoint in sniperSpawnPoints do
+		if not occupiedSniperSpawns[spawnPoint.name] then
+			local surface = raycastMapSurface(spawnPoint.position, {
+				originY = spawnPoint.position.Y + 200,
+				maxDistance = 500,
+				requireBuilding = true,
+				rejectTransparent = true,
+			})
+			if surface then
+				local surfaceGap = spawnPoint.position.Y - surface.position.Y
+				if surfaceGap >= -2 and surfaceGap <= SNIPER_ROOFTOP_SURFACE_MAX_GAP then
+					local flatPosition = Vector3.new(spawnPoint.position.X, 0, spawnPoint.position.Z)
+					table.insert(candidates, {
+						spawnPoint = spawnPoint,
+						surface = surface,
+						dist = flatDrop and (flatPosition - flatDrop).Magnitude or 0,
+					})
 				end
 			end
 		end
 	end
 
-	local list = {}
-	local flatDrop = Vector3.new(dropPoint.X, 0, dropPoint.Z)
-	for _, candidate in best do
-		candidate.dist = (Vector3.new(candidate.x, 0, candidate.z) - flatDrop).Magnitude
-		table.insert(list, candidate)
-	end
-	table.sort(list, function(a, b)
+	table.sort(candidates, function(a, b)
 		return a.dist < b.dist
 	end)
-	return list
+	return candidates
+end
+
+local function findGroundFallbackPosition(center)
+	center = center or mapCenter or spawnPoints[1]
+	if not center then
+		return nil, nil
+	end
+
+	local points = { center }
+	for _, point in spawnPoints do
+		if point ~= center then
+			table.insert(points, point)
+		end
+	end
+	table.sort(points, function(a, b)
+		local aOffset = Vector3.new(a.X - center.X, 0, a.Z - center.Z)
+		local bOffset = Vector3.new(b.X - center.X, 0, b.Z - center.Z)
+		return aOffset.Magnitude < bOffset.Magnitude
+	end)
+
+	for _, point in points do
+		local surface = raycastMapSurface(point, {
+			originY = point.Y + 200,
+			maxDistance = 500,
+			requireGround = true,
+			rejectTransparent = true,
+		})
+		if surface then
+			return Vector3.new(point.X, surface.position.Y, point.Z), surface.position.Y
+		end
+	end
+
+	return nil, nil
 end
 
 -- 予約中・生存中でないSniperSpawnをランダムに1つ予約して返す。
 -- この関数からspawnEnemyまでyieldしないため、同時到着したヘリ間でも重複しない。
-local function reserveSniperSpawn()
-	local available = {}
-	for _, spawnPoint in sniperSpawnPoints do
-		if not occupiedSniperSpawns[spawnPoint.name] then
-			table.insert(available, spawnPoint)
-		end
-	end
-	if #available == 0 then
+local function reserveSniperSpawn(candidates)
+	if #candidates == 0 then
 		return nil
 	end
 
-	local selected = available[rng:NextInteger(1, #available)]
-	occupiedSniperSpawns[selected.name] = true
+	-- 既存のSniperSpawn予約と同じく、現在有効な候補からランダムに選ぶ。
+	local selected = candidates[rng:NextInteger(1, #candidates)]
+	occupiedSniperSpawns[selected.spawnPoint.name] = true
 	return selected
 end
 
--- ヘリ到着イベントからの同時配置(Step5-2)。entry.arrivalSpawnsの各typeをcount体ぶん、
--- 同一フレーム内で生成する(降下演出は使わない)。固定MAPではplacement=="rooftop"を
--- Metadata.SniperSpawnsからの配置として扱い、屋上自動探索や地上フォールバックは行わない。
-local function spawnArrivalUnits(squadId, arrivalSpawns)
+-- ヘリ輸送1回ぶんの処理本体。DeploySquadから直接呼ばれる(このsquadListにはヘリ以外の
+-- 同時エントリが無い前提だが、将来混在しても後続entryをブロックしない設計にはしていない。
+-- 現状の★2編成が単一entryのため許容する)
+local function spawnArrivalUnits(squadId, arrivalSpawns, fallbackCenter)
 	for _, spawnEntry in arrivalSpawns do
+		if finalPhase then
+			return
+		end
 		if spawnEntry.placement ~= "rooftop" then
 			warn(("[EnemyManager] 未知のplacement '%s' (タイプ '%s') のarrivalSpawnsを無視します")
 				:format(tostring(spawnEntry.placement), spawnEntry.type))
 		else
-			local warnedNoSpawn = false
+			local warnedNoRooftop = false
 			for _ = 1, spawnEntry.count do
-				local spawnPoint = reserveSniperSpawn()
-				if not spawnPoint then
-					if not warnedNoSpawn then
-						warn("[EnemyManager] SniperSpawnの空きがないためSpawnをスキップします")
-						warnedNoSpawn = true
-					end
-				else
-					local enemy = spawnEnemy(spawnEntry.type, spawnPoint.position, squadId, {
+				if finalPhase then
+					return
+				end
+				local rooftop = reserveSniperSpawn(findRooftopCandidates(fallbackCenter))
+				local spawnPosition
+				local spawnOptions
+				if rooftop then
+					spawnPosition = rooftop.spawnPoint.position
+					spawnOptions = {
 						alignToGround = true,
-						sniperSpawnName = spawnPoint.name,
-					})
+						groundSurfaceY = rooftop.surface.position.Y,
+						sniperSpawnName = rooftop.spawnPoint.name,
+						sniperPlacement = "rooftop",
+					}
+				else
+					if not warnedNoRooftop then
+						warn("[EnemyManager] 有効な屋上がないためSniperを地上へフォールバックします")
+						warnedNoRooftop = true
+					end
+					local groundPosition, groundY = findGroundFallbackPosition(fallbackCenter)
+					if groundPosition then
+						spawnPosition = groundPosition
+						spawnOptions = {
+							alignToGround = true,
+							groundSurfaceY = groundY,
+							sniperPlacement = "ground",
+						}
+					end
+				end
+
+				if spawnPosition then
+					local enemy = spawnEnemy(spawnEntry.type, spawnPosition, squadId, spawnOptions)
+					if not enemy and rooftop then
+						occupiedSniperSpawns[rooftop.spawnPoint.name] = nil
+					end
 					if not enemy then
-						occupiedSniperSpawns[spawnPoint.name] = nil
-						-- systemDisabled等で失敗しても、この個体ぶんのpendingは必ず消費する(§4の急所)
-						warn(("[EnemyManager] 到着時配置で%sの生成に失敗しました (squad=%d)")
+						warn(("[EnemyManager] 到着時の%s生成に失敗しました (squad=%d)")
 							:format(spawnEntry.type, squadId))
 					end
+				else
+					warn(("[EnemyManager] 地上フォールバック位置を取得できず%sを生成できませんでした (squad=%d)")
+						:format(spawnEntry.type, squadId))
 				end
 				decrementPending(squadId)
 			end
@@ -2155,11 +2482,8 @@ local function spawnArrivalUnits(squadId, arrivalSpawns)
 	end
 end
 
--- ヘリ輸送1回ぶんの処理本体。DeploySquadから直接呼ばれる(このsquadListにはヘリ以外の
--- 同時エントリが無い前提だが、将来混在しても後続entryをブロックしない設計にはしていない。
--- 現状の★2編成が単一entryのため許容する)
 local function deployByHelicopter(squadId, entry, token)
-	if roundToken ~= token or retiredSquads[squadId] or not aggressive then
+	if roundToken ~= token or retiredSquads[squadId] or not aggressive or finalPhase then
 		return
 	end
 	local cfg = Config.Threat.HelicopterTransport
@@ -2228,7 +2552,7 @@ local function deployByHelicopter(squadId, entry, token)
 	-- 到着イベント: arrivalSpawns(Step5-2のSniper等)を同一フレームで生成する。
 	-- 既存のSoldier降下ループより先に行う(§2の急所: 同じヘリの到着イベントから生成する)
 	if entry.arrivalSpawns then
-		spawnArrivalUnits(squadId, entry.arrivalSpawns)
+		spawnArrivalUnits(squadId, entry.arrivalSpawns, dropPoint)
 	end
 
 	-- dropPointからexit方向へ低速前進しながら、現在のヘリXZを基準に1人ずつ投下する。
@@ -2281,14 +2605,14 @@ end
 -- transportが無ければ従来どおりの直接生成、"helicopter"ならヘリ輸送、それ以外の文字列は
 -- warnして無視する(通常スポーンへの黙示フォールバックはしない。§27)
 function EnemyManager.DeploySquad(squadId, squadList)
-	if systemDisabled then
+	if systemDisabled or finalPhase then
 		return
 	end
 	local token = roundToken
 	task.spawn(function()
 		-- 撤退済みチェック(Step5-0)。開始直後に1回。retiredSquads[squadId]は通常
 		-- ここではまだ立っていない(新規squadIdなので)が、多重防御として置く
-		if roundToken ~= token or retiredSquads[squadId] then
+		if roundToken ~= token or retiredSquads[squadId] or finalPhase then
 			return
 		end
 		-- この1回の派遣に閉じた使用済み座標の集合(手順6)。road個体だけが書き込む
@@ -2305,7 +2629,7 @@ function EnemyManager.DeploySquad(squadId, squadList)
 				for _ = 1, entry.count do
 					-- 各個体を生成する直前の撤退済みチェック(Step5-0)。派遣途中で昇格すると
 					-- ここで止まり、旧squadIdの残り個体を生成しなくなる
-					if roundToken ~= token or retiredSquads[squadId] then
+					if roundToken ~= token or retiredSquads[squadId] or finalPhase then
 						return
 					end
 					local point = pickSpawnPoint(usedPoints)
@@ -2362,6 +2686,14 @@ function EnemyManager.RetreatSquad(squadId)
 
 	-- enemiesを反復しながら削除しない(取りこぼし防止)。対象を先に配列へ集めてから処理する
 	local toRetreat = {}
+	for model, record in fallingSnipers do
+		if record.enemy.squadId == squadId then
+			fallingSnipers[model] = nil
+			if model.Parent then
+				model:Destroy()
+			end
+		end
+	end
 	for model, enemy in enemies do
 		if enemy.squadId == squadId and enemy.alive then
 			table.insert(toRetreat, { model = model, enemy = enemy })
@@ -2373,6 +2705,7 @@ function EnemyManager.RetreatSquad(squadId)
 
 		-- alive=falseはこの時点で設定する。これにより既に予約済みのテレグラフ攻撃も
 		-- resolveAttack()の既存enemy.aliveチェックで無効になる(§8-1)
+		cancelSniperAim(enemy)
 		enemy.alive = false
 		releaseSniperSpawn(enemy)
 		model:SetAttribute("Retreating", true)
@@ -2448,12 +2781,32 @@ end
 -- false: 新規の発砲を止め、移動も止める(モデルは消さない。見た目の継続性のため)
 function EnemyManager.SetAggressive(enabled)
 	aggressive = enabled
+	if enabled then
+		finalPhase = false
+	end
+end
+
+-- FINAL開始時の増援停止。既に地上へ出ている敵は削除・撤退させず、
+-- 飛行中のヘリとその未完了投下だけを中断する。以後のDeploySquad/spawnEnemyも
+-- finalPhaseガードで拒否するため、同一フレームや遅延callbackの新規生成を防ぐ。
+function EnemyManager.StopReinforcements()
+	finalPhase = true
+	table.clear(pendingDeployments)
+	for model, transport in activeTransports do
+		transport.cancelled = true
+		activeTransports[model] = nil
+		if model.Parent then
+			model:Destroy()
+		end
+	end
 end
 
 function EnemyManager.Clear()
 	roundToken += 1
 	aggressive = false
+	finalPhase = false
 	for model in enemies do
+		cancelSniperAim(enemies[model])
 		model:Destroy()
 	end
 	table.clear(enemies)
@@ -2463,9 +2816,16 @@ function EnemyManager.Clear()
 		end
 	end
 	table.clear(retreatingEnemies)
+	for model in fallingSnipers do
+		if model.Parent then
+			model:Destroy()
+		end
+	end
+	table.clear(fallingSnipers)
 	table.clear(playerState)
 	table.clear(killCounts) -- RESULTでGetKillCounts()を読み終えた後のLOBBYで呼ばれるので、順序は問題ない
 	table.clear(retiredSquads) -- 次ラウンドでsquadIdが1から再利用されるため必須(Step5-0)
+	nextSniperAimId = 0
 	table.clear(pendingDeployments) -- 次ラウンドへ持ち越さない(Step5-1)
 	table.clear(occupiedSniperSpawns) -- 生存中・予約中のSniperSpawnをすべて解放する
 	for model in activeTransports do

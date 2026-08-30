@@ -6,6 +6,7 @@
 
 `ReplicatedStorage/Config.lua` / `ServerScriptService/GameManager.server.lua` /
 `ServerScriptService/Modules/MapRuntime.lua` / `CityGenerator.lua` / `DestructionManager.lua` / `NPCManager.lua` / `WeaponServer.lua` /
+`ServerScriptService/Modules/KaijuManager.lua` /
 `StarterPlayer/StarterPlayerScripts/WeaponClient.client.lua` / `EffectsClient.client.lua` / `UIController.client.lua`
 
 `archive/` 内の `roblox_destruction_game_spec.md`・`city_expansion_spec.md`・`visual_upgrade_spec.md`・
@@ -39,7 +40,8 @@ ServerScriptService
    ├─ NPCManager (ModuleScript)         軽量NPC(徘徊・パニック逃走・即死ラグドール)
    ├─ RoundClock (ModuleScript)         バトル残り時間の管理(deadline方式・増減対応・損失キャップ)
    ├─ ThreatManager (ModuleScript)      段階(★)の政策。スコア監視・昇格・編成指示
-   ├─ WeaponServer (ModuleScript)       武器3種のサーバー処理・スコア集計
+   ├─ KaijuManager (ModuleScript)       ★4怪獣の生成・登場演出・ラウンド境界の破棄
+   ├─ WeaponServer (ModuleScript)       武器3種のサーバー処理(Enabledフィルタ付き)・スコア集計
    ├─ VisualSetup (ModuleScript)        ライティングの初期設定(起動時1回。Terrainは生成しない)
    └─ TemplateValidator (ModuleScript)  手作りBuildingTemplatesの検証(従来モードのみで使用)
 
@@ -52,7 +54,9 @@ StarterPlayer/StarterPlayerScripts
 ### 各モジュールの責務
 
 - **GameManager.server.lua**: `Remotes`フォルダ(RemoteEvent一式)を起動時に自動生成。各モジュールへ依存を注入(`Init`)。ラウンドを `LOBBY → BATTLE → RESULT` の無限ループで回す。LOBBYごとに`MapRuntime.LoadRound()`で固定MAPを再ロードし、その`buildings`を`DestructionManager`へ渡す。LOBBYは`runPhase`(固定長カウントダウン)、BATTLEは`runBattlePhase`(`RoundClock`の残り時間が尽きるまで)で毎秒`RoundState`を全クライアントに通知。**RESULTは手動進行**: `waitForReady()`が`Ready`リモート(誰か1人が「次へ」を押す)または`Config.Round.ResultTimeout`(既定120秒)のどちらか早い方まで待ち、`RoundState`の"RESULT"は1回だけ送信する(毎秒送信はしない)。RESULT突入時にランキングへ撃破数をマージし、建物の全体破壊率を同じ`buildings`テーブルから集計して`Result`に添える。
-- **MapRuntime.lua**: `ServerStorage.FixedMapTemplate`と必須構造を、既存`workspace.Map`の削除前に検証する。正常ならCloneを`workspace.Map`として配置し、`Buildings`直下の各Modelへ連番`BuildingId`を割り当てる。各建物配下の全BasePartのうち`Indestructible=true`でないものに`Destructible`タグと`BuildingId`を設定し、破壊率用`buildings`テーブルを作る。Modelに数値`BaseY`があれば優先し、無ければ全BasePartのワールドAABB下端から自動算出する。`Metadata.MapBounds`は`Orientation=(0,0,0)`だけを許可し、`Position`と`Size`から`minX/maxX/minZ/maxZ`を計算する。戻り値は`{map, buildings, bounds}`。
+- **MapRuntime.lua**: `ServerStorage.FixedMapTemplate`と必須構造を、既存`workspace.Map`の削除前に検証する。正常ならCloneを`workspace.Map`として配置し、`Buildings`直下の各Modelへ連番`BuildingId`を割り当てる。各建物配下の全BasePartのうち`Indestructible=true`でないものに`Destructible`タグと`BuildingId`を設定し、破壊率用`buildings`テーブルを作る。Modelに数値`BaseY`があれば優先し、無ければ全BasePartのワールドAABB下端から自動算出する。`Metadata.MapBounds`は`Orientation=(0,0,0)`だけを許可し、`Position`と`Size`から`minX/maxX/minZ/maxZ`を計算する。戻り値は`{map, buildings, bounds, enemySpawnPoints, sniperSpawnPoints, bossSpawnPoints, npcSpawnPoints, kaijuPath, roadNetwork}`。
+- **KaijuManager.lua**: `ServerStorage.KaijuTemplate`を`Workspace.KaijuRuntime`へラウンド中1体だけCloneする。BoundingBoxから水中待機・浮上・海岸水面・接地のPivot Yを導出し、`Waiting → Rising → Turning → Moving → Landing → Landed`をHeartbeatで進める。各BasePartはHRPのみ固定、他は非固定、全BasePartは非衝突・非Touch・非Queryとする。Phase 4-2ではFire Breath/Tail Spinの攻撃を担当し、HP・撃破・追跡は扱わない。`Clear()`は世代を無効化してRuntimeフォルダごと破棄する。
+- **MapRuntime.lua**: 上記に加え、`Metadata.KaijuSpawn`と`Metadata.KaijuShorePoint`の座標・CFrameだけを`MapContext.kaijuPath`へコピーする。`Config.Kaiju.Enabled=false`の場合はこの2点を必須検証せず、`kaijuPath=nil`を返す。
 - **CityGenerator.lua**: 旧グリッド/従来モードの手続き生成コード。ファイルは互換・参照用に残すが、固定MAP Phase 1の`GameManager`からはrequireも呼び出しもされない。
 - **DestructionManager.lua**: `Explode(ctx)`(`ctx = {position, radius, attacker, source, scoreScale?, maxReal?, bonusPolicy?, silent?}`という単一テーブル引数)が全武器の爆発処理の唯一の入口。破壊対象("Destructible"タグ)の検出・本物/ダミー破片への振り分け・瓦礫キュー管理・スコア加算・建物破壊率集計・全壊ボーナス判定・爆風の影響を受けるモジュール群への委譲(`deps.blastListeners`配列。現状は`NPCManager.OnExplosion`と`EnemyManager.OnExplosion`の2件を登録)を行う。
 - **EnemyManager.lua**: 敵(★1〜)の実体。`NPCManager`の軽量設計(Humanoid不使用・全パーツAnchored・共有Heartbeatで補間移動)を手法としてコピーしている(`NPCManager`自体は変更しない)。個体生成は`spawnEnemy(type, position, squadId)`の単一入口(パトカーの降車もここを通る)。道路交点(`CityGenerator.GetRoadLines()`の直積)から`Config.Threat.Spawn.MinDistanceFromPlayer`以上離れた点を選んで湧く。移動は`etype.Movement`で分岐する:`"direct"`(既定)は`AttackRange`を境に`ApproachSpeed`/`MoveSpeed`の2段階で直進。`"road"`(パトカー用。Step3)は道路網の交点だけを経由してプレイヤーへ接近する専用AI(マンハッタン経路構築・車線オフセット・中間ウェイポイントは距離ではなく「通り過ぎたか」を内積で判定・向き補間)。攻撃は赤いビーム予告(`Config.Threat.Damage.BeamDuration`秒だけ画面に残る、見た目専用)を出したうえで、判定タイミング(敵種別の`Telegraph`。既定`Config.Threat.Damage.DefaultTelegraph=0`)が0なら同一フレームで同期的に、正の値ならその秒数後に`task.delay`で、`resolveAttack`が距離・遮蔽を再判定してから命中判定を行う(判定タイミングと見た目の表示時間は別々の値)。撃破時は`NPCManager.killNpc`と同じ手法でラグドール化し(`CollisionGroup="Debris"`を流用)、`Config.Threat.CorpseDespawnTime`後に消える(`DestructionManager`の瓦礫キューには入れない)。`workspace.Enemies`に配置し、`Destructible`タグは付けない。`CityGenerator.GetRoadLines()`が`nil`/空を返した場合(従来モード等)は`warn`を1回出して自身を無効化し、以降は何もしない。撃破数の集計(`GetKillCounts()`。Playerオブジェクトをキーに持つ`{[Player]=number}`をシャローコピーして返す。種類は問わない合計)もここが担当し、リザルトの表示に使われる。`Clear()`で`killCounts`をリセットする(RESULTで読み終えた後のLOBBYで呼ばれるため順序は問題ない)。
@@ -104,6 +108,18 @@ StarterPlayer/StarterPlayerScripts
 | Props.CarsPerRoad | 3 |
 | Props.TreesPerBlock | 5 |
 | Props.BenchesPerBlock | 1 |
+
+### Config.Kaiju
+| キー | 値 | 備考 |
+|---|---|---|
+| Enabled | false | falseの場合は怪獣経路マーカーの検証・登場を無効化。本番自動起動はPhase 4-2でも無効 |
+| TemplateName | "KaijuTemplate" | `ServerStorage`内のModel名 |
+| SourceAssetId | 93372820152503 | Studio配置済みアセットの識別用 |
+| RootPartName | "HumanoidRootPart" | Clone後のPrimaryPart検証対象 |
+| SubmergedWaitDuration / RiseDuration | 1 / 5 | 海中待機 / 浮上(秒) |
+| TurnDuration / MoveSpeed / LandDuration | 1.25 / 12 / 1.5 | 旋回 / 海岸移動 / 上陸(秒・stud/s) |
+| StartTopClearance / SwimFootDepth | 2 / 4 | 水中待機時の上端 / 浮上後の足元の水面下距離(stud) |
+| RuntimeFolderName | "KaijuRuntime" | Workspace内のラウンドRuntimeフォルダ |
 
 ### Config.Round
 | キー | 値 | 備考 |
@@ -157,13 +173,20 @@ StarterPlayer/StarterPlayerScripts
 | MaxPartSize | 8 |
 
 ### Config.Weapons
-| 武器 | DisplayName | SlotKey | Radius | Cooldown | その他 |
-|---|---|---|---|---|---|
-| Bazooka | バズーカ | 1 | 12 | 0.3 | Speed=100, MaxDistance=140, AutoFire=true |
-| Airstrike | エアストライク | 2 | 12 | 20 | Delay=3, DropHeight=80, FallTime=1.1, 絨毯爆撃の各キー(下表) |
-| RemoteBomb | リモート爆弾 | 3 | 15 | 1 | MaxBombs=10, MaxPlaceDistance=50, ChainBonus(下表) |
+| 武器 | Enabled | DisplayName | SlotKey | Radius | Cooldown | その他 |
+|---|---|---|---|---|---|---|
+| Bazooka | true | バズーカ | 1 | 12 | 0.3 | Speed=100, MaxDistance=140, AutoFire=true |
+| Airstrike | true | エアストライク | 2 | 12 | 20 | Delay=3, DropHeight=80, FallTime=1.1, 絨毯爆撃の各キー(下表) |
+| RemoteBomb | false | リモート爆弾 | 3 | 15 | 1 | MaxBombs=10, MaxPlaceDistance=50, ChainBonus(下表) |
 
 `Config.WeaponOrder = { "Bazooka", "Airstrike", "RemoteBomb" }`
+
+`Config.IsWeaponEnabled()`が武器共通の有効判定を行う。`Enabled=false`だけを無効とし、
+`nil`は後方互換のため有効として扱う。武器定義とRemoteBombの設置・起爆・Chain Bonus・専用UIは
+削除せず保持する。
+
+> RemoteBombは削除ではなく一時無効化。現在は`Config.Weapons.RemoteBomb.Enabled=false`であり、
+> ゲーム内の役割を再検討するまで公開版では使用しない。再有効化はこの値を`true`へ戻して再デプロイする。
 
 **Config.Weapons.Bazooka(Step4dで射程制限・連射に作り替え)**
 
@@ -213,11 +236,10 @@ StarterPlayer/StarterPlayerScripts
 `workspace.Map`と`workspace.Terrain`、`IgnoreWater=true`で、失敗した爆弾はクリックYへ
 フォールバックせずスキップする。赤い矩形マーカーは見た目専用で、着弾・破壊判定には使わない。
 
-Airstrikeの`DestructionManager.Explode()`呼び出しだけが`respectOcclusion=true`を渡す。
-半径内候補を集めた後、距離ソート・`maxReal`・スコア・破壊率処理より前に、爆心から候補中心への
-Raycastで最初のヒットが候補自身であるパーツだけを残す。バズーカ、リモート爆弾、敵の爆発には
-この遮蔽処理を適用しない。破壊済みの本物瓦礫・焼け残り・ダミー破片は`CanQuery=false`となり、
-後続爆弾の地表面・遮蔽Raycastを塞がない。
+Airstrikeの`DestructionManager.Explode()`呼び出しは`respectOcclusion`を渡さず、爆発遮蔽を無視して
+建物内部まで破壊する現行仕様を維持する。バズーカ、リモート爆弾、敵の爆発にもこの遮蔽処理を
+適用しない。破壊済みの本物瓦礫・焼け残り・ダミー破片は`CanQuery=false`となり、後続爆弾の
+地表面Raycastを塞がない。
 
 **Config.Weapons.RemoteBomb.ChainBonus(Step4bで追加)**
 
@@ -292,7 +314,7 @@ Raycastで最初のヒットが候補自身であるパーツだけを残す。�
 ### Config.Threat(★1〜)
 | キー | 値 | 備考 |
 |---|---|---|
-| Enabled | false | 固定MAP Phase 1では道路・敵スポーン未対応のため無効。trueへ戻すのはMapContext連携後 |
+| Enabled | true | 固定MAPのEnemySpawns/RoadNodes/MapContext連携済み。falseで敵・Threat段階を無効化 |
 | ScoreSource | "sum" | "sum"=全プレイヤーのスコア合計 / "top"=最高スコア。`WeaponServer.GetTotalScore()`が参照 |
 | CheckInterval | 1 | 段階判定を行う間隔(秒) |
 | DebugLog | true | 段階到達時刻・湧き・撃破をサーバーログに出す |
@@ -315,10 +337,12 @@ Raycastで最初のヒットが候補自身であるパーツだけを残す。�
 | Spawn.Jitter | 6 | 交差点中心から警官を散らす最大距離(stud)。上限8(道路幅16の半分)。大きくしすぎるとバズーカ1発でまとめて倒せなくなる(Step3手順6) |
 | Marker.Enabled / MaxDistance / Text / Color | true / 300 / "!" / 赤 | 頭上マーカー(BillboardGui) |
 | Indicator.Enabled / MaxDistance / PoolSize / UpdateInterval / Margin | true / 400 / 8 / 0.1 / 40 | 画面端の方向インジケータ(クライアント側) |
-| EnemyTypes.PoliceOfficer / PoliceCar / Soldier | (§末尾参照) | Step3・Step5-1完了により3種とも実装済み。Tank(Step6)は未実装 |
+| EnemyTypes.PoliceOfficer / PoliceCar / Soldier / Tank | (§末尾参照) | ★1〜★3の敵種別は実装済み。★4怪獣はEnemyTypesへ登録せずEncounterで起動 |
 | HelicopterTransport.* | (§末尾参照) | Step5-1で新設。軍用ヘリの飛行・降下パラメータ。ヘリ自体はEnemyTypesに**登録しない**(戦闘する敵ではなく輸送演出専用) |
 | Stages[1] | ★1警察・Threshold=1000・Squad={PoliceCar×2, PoliceOfficer×2}・RespawnDelay=20 | 残りの警官はパトカーが道中で降車させる(§末尾参照)。全滅後RespawnDelay秒で新squadIdの再派遣(§17参照) |
-| Stages[2] | ★2軍隊・Threshold=4000(暫定値)・Squad={Soldier×4, transport="helicopter", arrivalSpawns={Sniper×2}}・ReinforcementInterval=20 | Step5-1/5-2で新設。生存数に関係なく20秒ごとに同じsquadIdへSquad一式を無制限追加(§17参照)。★3は未実装の敵種別(Tank)を参照するため未登録(登録するとエラーになる) |
+| Stages[2] | ★2軍隊・Threshold=4000(暫定値)・Squad={Soldier×4, transport="helicopter", arrivalSpawns={Sniper×2}}・ReinforcementInterval=20 | Step5-1/5-2で新設。生存数に関係なく20秒ごとに同じsquadIdへSquad一式を無制限追加(§17参照) |
+| Stages[3] | ★3戦車・Threshold=10000・Squad={Tank×2}・IndividualRespawnDelay=30 | Tankを1体ずつ同じsquadIdへ補充。建物砲撃を含む詳細は§21 |
+| Stages[4] | ★4怪獣・Threshold=20000・Encounter="Kaiju" | EnemyManagerの編成ではなくKaijuManagerの登場演出を起動。詳細は§23 |
 
 **Config.Threat.EnemyTypes.PoliceOfficer の内訳**
 
@@ -552,7 +576,7 @@ GRID_TILESIZE     = Config.City.RoadWidth + GRID_BLOCKSPAN = 24+108 = 132  -- St
 - `Config.Performance.MaxTotalParts = 35000`は旧CityGenerator用。固定MAPのロード上限としては未適用
 - タブレット実機での30fps確認は旧グリッドMAPでの結果。固定MAPでは未検証
 
-旧ゲーム側では★2軍隊、グリッド用の石垣・街小物、街小物の破壊処理まで実装済み。固定MAP版では敵システムを停止しており、固定MAP向けの`NPCSpawns`、`SniperSpawns`、`EnemySpawns`、`RoadNodes`は未実装。★3戦車と炎・煙の時間変化も未実装。
+旧ゲーム側では★2軍隊、グリッド用の石垣・街小物、街小物の破壊処理まで実装済み。固定MAP版では`NPCSpawns`、`SniperSpawns`、`EnemySpawns`、`RoadNodes`をMapContextへ接続し、★1〜★3敵と★4怪獣まで有効化している。怪獣本体の戦闘・HP・追跡・建物破壊は現Phaseの対象外で、実装していない。
 
 ## 6-1. モード方針
 
@@ -573,17 +597,11 @@ GRID_TILESIZE     = Config.City.RoadWidth + GRID_BLOCKSPAN = 24+108 = 132  -- St
 を1行追加すること。無いと、その建物のブロックは残骸化されず(§20参照)従来どおり`Destroy`
 されるだけになる(エラーにはならないが、その建物だけ焼け跡が残らない)。
 
-## 8. 未実装のまま保留(敵システム側)
+## 8. 未実装のまま保留(敵・怪獣側)
 
-固定MAP Phase 1では`Config.Threat.Enabled=false`で敵システム全体を停止している。以下は旧ゲーム側の実装状況であり、固定MAPで再び有効化するにはMapContext、スポーン地点、道路ノードの連携が別途必要。
+固定MAP版では`Config.Threat.Enabled=true`で★1〜★3の敵システムを有効化し、★4は`Encounter="Kaiju"`で怪獣登場演出を起動する。怪獣は`EnemyManager`へ登録せず、戦闘・HP・追跡・建物破壊を実装しない。
 
-`THREAT_DESIGN_PROPOSAL.md`の段階的実装順序(§6)に沿って、以下を意図的に未実装のまま保留している:
-
-- **戦車**(`Tank`。Step 6。建物破壊・`bonusPolicy="deny"`・貢献度クレジット方式もここで実装)
-- **★3の`Config.Threat.Stages`エントリ**(未実装の敵種別Tankを参照するため、実装が揃うまで登録しない)
-- **`DestructionManager.Init`への`hudRemote`配線**(Step 6で戦車のボーナス奪取通知に使用)
-- **敵の`Movement`種別**: `"direct"`(直進。警官・兵士)・`"road"`(道路網走行。Step3のパトカーで実装済み)は実装済み。ヘリはStep5-1で追加したが`Movement`種別としては実装していない(`EnemyTypes`に登録しない輸送演出専用オブジェクトのため。詳細は§14参照)
-- **レーダー(ミニマップ)**: 実装しない方針(頭上マーカー+画面端の方向インジケータの2本立てで代替)
+現Phaseで未実装のまま保留しているのは、怪獣を含む敵・怪獣の追加攻撃仕様、追加の敵種別、レーダー(ミニマップ)である。レーダーは頭上マーカーと画面端の方向インジケータで代替する方針。
 
 ---
 
@@ -714,12 +732,25 @@ Step 4dでバズーカの射程制限と同時に連射(押しっぱなし)も�
 引き継ぎ済みの課題。B+C案(閾値ベースの崩落+崩落分の減点)が推奨だが、A案(微小崩落)を実機で
 試して、浮いた構造物の見た目がどれだけ気になるかを先に判断する。
 
-### 11-4. `Tank`が未実装(Step5-1完了により`Helicopter`は解消)
+### 11-4. `Tank`実装済み(Step5-1完了により`Helicopter`は解消)
 
 `Helicopter`はStep5-1で解決した(EnemyTypeとしては実装せず、輸送演出専用オブジェクトとして実装。詳細は§14参照)。
-`Tank`は`Config.lua`にまだエントリが無い(`EnemyTypes`内にコメントで「Step6で追加する」と記載があるのみ)。
-**未実装の種別名を`Stages`に登録するとエラーになる。** ★3を有効化する際に、
-`Config.Threat.EnemyTypes`への追加と`EnemyManager`側の対応実装(`Body`の妥当性チェック含む)が必要。
+`Tank`は`Config.lua`の`EnemyTypes`と`Stages[3]`へ登録済みで、`EnemyManager`の汎用Model経路と建物砲撃を使用する(詳細は§21参照)。
+
+## 23. Phase 3-3: ★4 怪獣
+
+- `Config.Kaiju`で`ServerStorage.KaijuTemplate`、`HumanoidRootPart`、登場演出の時間・速度、`KaijuRuntime`を設定する。
+- `Config.Threat.Stages[4]`は`Threshold=20000`、`Encounter="Kaiju"`。怪獣はEnemyManagerのEnemyTypesへ登録せず、ThreatManagerからKaijuManagerを起動する。
+- `MapRuntime.LoadRound()`は原本の`Metadata.KaijuSpawn`と`KaijuShorePoint`を検証し、Instanceを保持せず座標値を`MapContext.kaijuPath`へ渡す。怪獣設定が無効ならこの2マーカーを要求しない。
+- `KaijuManager`は、海中待機・浮上・旋回・海岸移動・上陸を`Waiting → Rising → Turning → Moving → Landing → Landed`として実行する。戦闘・HP・追跡・建物破壊は実装しない。
+- 次ラウンド先頭の`GameManager`は`MapRuntime.LoadRound()`より前に`KaijuManager.Clear()`を呼び、旧世代の遅延処理を無効化して`KaijuRuntime`を破棄する。
+
+### 23-1. Studio確認結果
+
+- 対象Placeは `破壊する` (`PlaceId=109081398680442`)。`ServerStorage.KaijuTemplate`と2つのMetadata markerを確認した。
+- 20000点のインメモリ閾値プローブで、`Waiting`、`Rising`、`Turning`、`Moving`、`Landing`、`Landed`の全状態を順に確認した。最終Pivotは`(-595.0, 10.0, 250.0)`。
+- `KaijuManager.Clear()`直後に`Workspace.KaijuRuntime`と`Kaiju`が不在となり、残留コールバックによる再生成も無かった。
+- Placeの保存は行っていない。MCPから内部`RoundClock`/`Ready`を短絡できなかったため、実際の自動ラウンド遷移そのものは未確認で、GameManagerの呼出し順とClearのランタイム確認を根拠とする。
 
 ---
 
@@ -1578,7 +1609,8 @@ Studioで数値`BaseY`を設定済みなら手動値を優先し、未設定時�
 
 再生成時は既存の`CharacterAdded`経路を再利用する。LOBBY中の`CharacterAdded`では武器を配布せず、
 BATTLE開始時の`GiveToolsToAll()`だけが配布する。`WeaponServer.GiveTools()`は`WeaponKey`でBackpackと
-Characterを横断して重複を除外するため、再生成後もBazooka / Airstrike / RemoteBombは各1個だけとなる。
+Characterを横断して重複を除外する。現在は`Config.Weapons.RemoteBomb.Enabled=false`のため、再生成後も
+Bazooka / Airstrikeは各1個、RemoteBombは0個となる。
 
 ### 22-2. 停止中の個体別接地Y
 
@@ -1613,8 +1645,45 @@ BATTLE終了が投下途中に起きても、残りSoldierを遅延生成せず�
 ### 22-4. Studio確認結果
 
 - RESULTでCharacterを座標`(5000, 500, 5000)`へ移動して「次へ」を送信後、新Characterが固定MAPの
-  SpawnLocation付近へ生成され、旧Characterの検証属性が残らず、武器3種が各1個であることを確認
+  SpawnLocation付近へ生成され、旧Characterの検証属性が残らず、Bazooka / Airstrikeが各1個、RemoteBombが0個であることを確認
 - PoliceOfficer / Soldier / Sniper / PoliceCar / Tankは、停止または着地安定後6〜8秒間のY/XZ変化が0
 - Soldier 4人の生成間隔は`1.00 / 1.00 / 1.03秒`、XZ間隔は`27.7 / 31.9 / 34.2 studs`
 - ★2の1人目投下直後に★3へ上げ、6秒後も旧Soldierは1人、旧ヘリ0、Tank 2台であることを確認
 - BATTLE終了相当の`SetAggressive(false)`でも、1人目投下後6秒間Soldierは1人のまま、ヘリ0
+## Phase 4-1: 怪獣モデル読込・海からの出現・移動基盤
+
+Phase 4-1の現行追記。既存のPhase 3-3記録は旧経路の履歴として残す。
+
+- 使用モデル: `ServerStorage.KaijuTemplate`。原本は保持し、ラウンドごとにCloneする。Studio測定は15 BasePart、14 MeshPart、14 Motor6D、Boneなし、Humanoid 1、Animator 1、Script系0、BoundingBox約7.808 x 13.339 x 21.122 studs、PrimaryPartはHumanoidRootPart。
+- 使用Spawn: `ServerStorage.FixedMapTemplate.Metadata.BossSpawns.Boss03`（`-595, 3.5, 238`）。`MapRuntime`の既存`bossSpawnPoints`を値コピーし、設定名を優先、未指定時は名前順で選択する。実使用名をログする。
+- `KaijuManager`の公開APIは`Init`、`SetMapContext`、`Start`、`Stop`、`Clear`。MapContextの`bossSpawnPoints`、`center`、`bounds`だけを保持し、Mapやmarker Instanceは保持しない。
+- CloneはWorkspaceへ親付ける前にScript、LocalScript、ModuleScriptを除去する。Motor6D、Bone、AnimationController、Animator、Attachment、Weld構造は保持し、HumanoidRootPartだけAnchored=true、他BasePartはAnchored=false、全BasePartをCanCollide/CanTouch/CanQuery=falseにする。
+- 出現はBoundingBox上端がBossSpawn基準で水面下になる開始位置から、`Intro.RiseDuration=7`秒で完全出現位置まで`PivotTo`する。開始深度は`Intro.SubmergeRatio=1.1`でモデル高さに追従し、`PostRiseDelay=1`秒後に移動する。
+- 移動は`Movement.Speed=6` studs/sで`MapContext.center`へ直接進み、`StopDistance=8` studs内で`KaijuState=idle`にする。`ModelYawOffset=0`で顔を進行方向へ向ける。Pathfinding、HP、撃破、怪獣移動中の建物破壊は実装しない。Idle到達後の攻撃はPhase 4-2に記載する。
+- `Config.Kaiju.Enabled=false`を既定値とし、既存Stage 4定義は保持したまま本番自動起動を停止している。Studio検証時だけPlay中のメモリ上で明示的にtrueへ変更する。次フェーズで本番有効化を判断する。
+- generation tokenとHeartbeat接続の無効化を`Clear`で行い、RuntimeフォルダとCloneを破棄する。V1では移動中に建物を破壊しない。火炎・尻尾攻撃はPhase 4-2、HP・FINAL PHASEは後続Phase。
+
+## Phase 4-2: 火炎ブレス・360度尻尾回転攻撃
+
+Phase 4-2では、Phase 4-1の登場・移動基盤へ怪獣の最初の攻撃行動だけを接続する。本番の★4有効化は行わず、`Config.Kaiju.Enabled=false`を維持する。
+
+- 状態は外部属性`KaijuState`で`intro`、`moving`、`idle`、`fireBreath`、`tailSpin`を明示する。攻撃中は別攻撃へ遷移せず、攻撃終了後は`idle`へ戻り、`Combat.AttackCooldown=2`秒を置く。中心到達前は攻撃しない。
+- 使用Animationは`Idle=125654140184351`、`FireBreath=79039210156539`、`Walk=107452436011504`。Trackはすべて`KaijuManager.LoadAnimation()`で読み込み、KaijuManagerが所有する。`moving`はWalk Loop、`idle`はIdle Loop、`fireBreath`はFire Breathを1本だけ再生する。Tail Spinは専用Animation未作成のためTrackを停止し、Model全体を回転させる暫定版である。
+- `Combat.ThinkInterval=0.25`秒ごとに、Character、HumanoidRootPart、Humanoid.Health>0を満たす最短Playerを取得する。近距離（水平距離`TailSpinRange=30`以内）はTail Spin、それ以外はFire Breathを選択する。対象不在時はIdleを維持する。
+- Fire Breathは対象方向を開始時に一度だけ確定し、`Windup=0.8`秒、`ActiveDuration=2.0`秒、`Recovery=0.4`秒で合計約3.2秒。前方`Range=100`、`Width=20`、`Height=24`の直方体を攻撃範囲とし、Active開始時に範囲内Playerへ`PlayerPenalty=5`秒を1Player 1回だけ`RoundClock.Add()`で適用する。見た目はKaijuRuntime配下の半透明Neon Partによる暫定VFXで、判定とは分離する。
+- Fire Breathの建物破壊は火炎線上へ`BuildingBlastSpacing=20` studsごとに`BuildingBlastRadius=10`の`DestructionManager.Explode()`を呼ぶ。初期値では5回、`MaxBuildingExplosions=8`を上限とする。`attacker=nil`、`bonusPolicy="deny"`、`source="KaijuFireBreath"`でPlayerスコアへ加算しない。移動中の建物破壊は未実装である。
+- Tail Spinは`Windup=0.8`秒の予告後、`SpinDuration=1.2`秒でModelの初期CFrameを基準にYaw 360度を補間する。毎Heartbeatの角度は経過割合から算出し、終了時に開始CFrameを再適用するため向きは正確に復元される。中心から`Radius=30`、Y差も同半径以内のPlayerへ`PlayerPenalty=8`秒を1Player 1回だけ適用し、中心へ`BuildingBlastRadius=24`のExplodeを1回行う。破壊は`source="KaijuTailSpin"`、`attacker=nil`、`bonusPolicy="deny"`とする。
+- Fire Breathの爆発回数、Tail Spinの爆発回数・回転角・実測経過時間、Playerヒット数はRuntime Model Attributeへ記録する。爆発は毎Heartbeatではなく攻撃1回あたりの固定少数回に抑える。
+- Fire Breath/Tail SpinのWindup、Active、Recovery、Spin、Cooldownは同一Heartbeat状態機械で管理する。`Clear()`は世代を進めてHeartbeatとTrackを停止し、KaijuRuntime配下のVFX・Modelを破棄する。Clear後に旧攻撃の時間減少、Explode、VFX、Animation復帰、Combat loopが次ラウンドへ残らないことを契約とする。
+- 未実装: 専用Tail Spin Animation、本格Death/攻撃VFX、移動中建物破壊、部位破壊、弱点、Tank vs Kaiju、FINALの最終バランス調整。Tail Spinは将来Animation Editorの専用Animationへ差し替える。
+- Phase 4-3Bで`Config.Kaiju.Enabled=true`とし、既存Stage 4をFINAL開始へ接続する。Place保存・Publishは行わず、数値は実プレイ後に調整する。
+
+## Phase 4-3B: ★4 + FINAL PHASE本番接続
+
+- ★4は通常Enemy StageではなくFINAL開始トリガー。`Config.Threat.Stages[4].Threshold=20000`、`FinalPhase=true`、`Encounter="Kaiju"`を暫定値として使用する。
+- ThreatManagerは★4到達をGameManagerへ通知する。GameManagerが1ラウンド1回だけFINALを開始し、`Config.FinalPhase.Duration=120`秒へRoundClockを切り替えてからKaijuManagerを起動する。
+- ★4到達時に既存のPolice / Soldier / Sniper / TankはRetreat・Clearせず戦場へ残す。ThreatManagerの定期増援・再派遣を停止し、EnemyManagerは飛行中ヘリと未完了投下、新規Deployだけを停止する。
+- FINAL中のRoundClock.Add()は通常Enemyの被弾、Enemy撃破、建物全壊などを無効化し、`kaijuFireBreath` / `kaijuTailSpin`の怪獣Penaltyだけを許可する。通常のBazooka / Airstrikeと建物破壊は継続するが、全壊の時間加算は行わない。
+- KaijuManagerの`OnDefeated`通知はdead確定後に1回だけ発火する。GameManagerの単一`resolveFinalPhase(reason)`がDefeated / TIME UPを先着順で確定し、TIME UPはMultiplier・Time Bonusなし、Damage Scoreを保持したまま既存RESULTへ進む。
+- 撃破時はDamage ScoreとDefeat Scoreを含む撃破時点のPlayerスコアへ`DefeatMultiplier=1.5`を差額加算し、その後`FINAL残り秒数 × TimeBonusPerSecond=100`を別categoryで加算する。死亡演出完了待ち`ResultDelayAfterDefeat=3`秒後にRESULTへ遷移する。
+- 暫定Config値は`Threshold=20000`、`Duration=120`、`DefeatMultiplier=1.5`、`TimeBonusPerSecond=100`。★4到達時刻、FINAL撃破率、開始時平均スコアを実プレイログで計測し、後日調整する。

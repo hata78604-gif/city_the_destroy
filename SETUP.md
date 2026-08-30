@@ -3,10 +3,11 @@
 Roblox Studio にスクリプトを配置してゲームを動かすまでの手順書です。
 プログラミングの知識がなくても、上から順にやれば動きます。
 
-> **現在の本番は固定MAP Phase 1**。`ServerStorage.FixedMapTemplate`を毎ラウンドCloneして使用する。
+> **現在の本番は固定MAP版(★1〜★4対応)**。`ServerStorage.FixedMapTemplate`を毎ラウンドCloneして使用する。
 > `CityGenerator.lua`は互換・参照用に残しているが、現在の`GameManager`からは使用しない。
 > 固定MAP原本はRojo管理外のため、Roblox Studio側で手動配置する必要がある(2-4節参照)。
-> Phase 1では敵・道路経路・固定スポーンMetadataは未対応で、`Config.Threat.Enabled=false`としている。
+> 固定MAPでは敵・道路経路・固定スポーンMetadataを使用し、`Config.Threat.Enabled=true`としている。★4は`Config.Threat.Stages[4]`の怪獣登場演出である。
+> Phase 4-2でFire Breath/Tail Spinの攻撃を実装済み。HP・追跡・撃破・怪獣移動中の建物破壊は現Phaseの対象外。詳細は`CURRENT_SPEC.md`を参照。
 > **現状の完全な仕様(Configの全キー・生成式・破壊処理・NPCの仕組み)は `CURRENT_SPEC.md` を参照。**
 > 古い変更指示書(`roblox_destruction_game_spec.md`等)は `archive/` に移動済み。
 > 各ステップ完了時、PROGRESS.md に「実装内容・暫定措置・ハマった点・申し送り・ユーザー手作業」を追記する
@@ -42,6 +43,7 @@ ServerScriptService
    ├─ RoundClock        (ModuleScript)    ← RoundClock.lua の中身
    ├─ TemplateValidator (ModuleScript)    ← TemplateValidator.lua の中身
    ├─ ThreatManager     (ModuleScript)    ← ThreatManager.lua の中身
+   ├─ KaijuManager      (ModuleScript)    ← KaijuManager.lua の中身
    ├─ VisualSetup       (ModuleScript)    ← VisualSetup.lua の中身
    └─ WeaponServer      (ModuleScript)    ← WeaponServer.lua の中身
 
@@ -579,7 +581,7 @@ Phase 10の★2確認後、同じ★2昇格でスナイパーの挙動を確認�
 | UIが出ない | UIController が StarterPlayerScripts にあるか、LocalScript か確認 |
 | 爆発音だけ鳴らない | Config の `Sounds.Explosion` の音IDが無効(エラーにはならない仕様)。下記の方法で差し替える |
 | 敵の挙動を丸ごと切り離して他の不具合を切り分けたい | `Config.Threat.Enabled` を `false` にしてテストを再起動する。段階監視・湧き・攻撃が一切動かなくなり、Step 1 までと同じ挙動に戻る |
-| 敵が全く湧かない | 固定MAP Phase 1では仕様どおり。`Config.Threat.Enabled=false`で、EnemySpawns/RoadNodes/MapContext連携は後続Phaseで実装する |
+| 敵が全く湧かない | `Config.Threat.Enabled=false`、スコア未到達、または固定MAPのEnemySpawns/RoadNodes/MapContext不足を確認する。20000点到達後の怪獣はPhase 3-3のKaijuTemplateと2つの経路markerも確認する |
 
 ### 音の差し替え方法
 
@@ -896,7 +898,7 @@ Phase 3-2a版へ同期して、次を確認する。
 
 1. 1ラウンド終了時にMAP内の任意の遠い場所へ移動し、RESULTの「次へ」を押す。次ラウンドでは
    前ラウンド終了地点ではなく、固定MAPの`SpawnLocation`から新しいCharacterで始まること。
-2. BATTLE開始時、Bazooka / Airstrike / RemoteBombが各1個だけ存在し、再生成による二重配布が無いこと。
+2. BATTLE開始時、Bazooka / Airstrikeが各1個だけ存在し、Enabled=falseのRemoteBombは存在せず、再生成による二重配布が無いこと。
 3. ★1でPoliceOfficerをプレイヤー近くへ停止させ、PoliceCarを道路目的地へ停車させる。
    6秒以上観察して地面へ沈み続けず、XZや向きが不自然に変化しないこと。
    PoliceOfficer / SoldierはEnemySpawn markerのY値ではなく、直下へRaycastしたMAP表面とR15の足裏を
@@ -912,6 +914,30 @@ Phase 3-2a版へ同期して、次を確認する。
 
 調整が必要な場合は`Config.Threat.HelicopterTransport.DropInterval`と`DropRunSpeed`だけを変更する。
 初期値は`1.0`秒と`30` studs/sで、投下中心間隔は両者の積になる。
+
+## Phase 3-3: ★4 怪獣 セットアップ・確認
+
+1. 対象Placeが `破壊する` (`PlaceId=109081398680442`) であることを確認する。別のStudioや別Placeへ
+   `KaijuTemplate`を配置しない。
+2. 対象Placeの`ServerStorage`にModel `KaijuTemplate`を配置する。`PrimaryPart`は
+   `HumanoidRootPart`、`Archivable=true`とし、モデル内のScriptは登場演出から実行しない。
+3. `ServerStorage.FixedMapTemplate.Metadata`直下にBasePart `KaijuSpawn`と
+   `KaijuShorePoint`を配置する。現行Placeの座標はそれぞれ`(-595,1,380)`と`(-595,1,250)`で、
+   両方に`KaijuPathMarker=true`を付け、Anchored・透明・非衝突・非Touch・非Queryにする。
+4. `Config` / `GameManager` / `Modules/MapRuntime` / `Modules/ThreatManager` /
+   `Modules/KaijuManager`をRojoまたは手動貼り付けで同期する。`KaijuManager`は
+   `ServerScriptService/Modules`に置く。
+5. Play中に検証用のスコアを20000点へ到達させ、Outputの`[ThreatManager] ★4 怪獣`を確認する。
+   `Workspace.KaijuRuntime.Kaiju`が生成され、状態が
+   `Waiting → Rising → Turning → Moving → Landing → Landed`の順に進むことを確認する。
+6. 最終的に怪獣の足元が`KaijuShorePoint`の海岸側へ揃い、怪獣が`workspace.Enemies`へ入らず、
+   戦闘・HP・追跡・建物破壊の処理を持たないことを確認する。
+7. RESULTの「次へ」で次ラウンドを開始し、旧ラウンドの`Workspace.KaijuRuntime`と`Kaiju`が
+   完全に消えること、遅延した登場処理で再生成されないことを確認する。Placeは保存せず、
+   確認後もStudio原本の`KaijuTemplate`と2つのmarkerが残っていることを確認する。
+
+`Config.Kaiju.Enabled=false`で切り分ける場合、`MapRuntime`は2つの怪獣markerを必須検証せず、
+`KaijuManager`も経路を無効化する。確認後も`Enabled=false`を維持する。
 
 ## 9. 公開するとき(おまけ)
 

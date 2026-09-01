@@ -19,10 +19,16 @@ local Players = game:GetService("Players")
 local TweenService = game:GetService("TweenService")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local StarterGui = game:GetService("StarterGui")
+local RunService = game:GetService("RunService")
+local CollectionService = game:GetService("CollectionService")
 
 local Config = require(ReplicatedStorage:WaitForChild("Config"))
 local remotes = ReplicatedStorage:WaitForChild("Remotes")
 local readyRemote = remotes:WaitForChild("Ready")
+local devTestRemote = remotes:WaitForChild("DevTest")
+local devTestEnabled = RunService:IsStudio()
+	and typeof(Config.DevTestMode) == "table"
+	and Config.DevTestMode.Enabled == true
 
 local player = Players.LocalPlayer
 local playerGui = player:WaitForChild("PlayerGui")
@@ -100,6 +106,17 @@ local timerScale = Instance.new("UIScale")
 timerScale.Parent = timerLabel
 local TIMER_BASE_COLOR = timerLabel.TextColor3 -- 生成直後の実際の色を控える(ハードコードしない)
 
+-- マルチロックランチャーの現在値。サーバー承認済みロックだけを表示する。
+local lockLabel = makeLabel(hud, {
+	AnchorPoint = Vector2.new(0.5, 0),
+	Position = UDim2.new(0.5, 0, 0, 58),
+	Size = UDim2.fromOffset(220, 30),
+	Text = "LOCK 0 / 24",
+	TextColor3 = Color3.fromRGB(100, 225, 255),
+	Visible = false,
+	Active = false,
+})
+
 -- ★インジケータ(現在の段階。timerLabelの"左"に置く。
 -- 下に置くとStep1のフローティングラベル(ZIndex=0でtimerLabelの下を通る)の通り道と
 -- 重なってしまうため、横に並べることで衝突を避ける)
@@ -114,6 +131,19 @@ local threatLabel = makeLabel(hud, {
 })
 local threatScale = Instance.new("UIScale")
 threatScale.Parent = threatLabel
+
+-- ゲーム進行の主表示。サーバーから受け取ったTotal MAP破壊率を常時表示する。
+local mapLabel = makeLabel(hud, {
+	AnchorPoint = Vector2.new(0, 0),
+	Position = UDim2.fromOffset(10, 8),
+	Size = UDim2.fromOffset(240, 36),
+	Text = "MAP DESTROYED 0%",
+	TextColor3 = Color3.fromRGB(120, 230, 255),
+	TextXAlignment = Enum.TextXAlignment.Left,
+	Active = false,
+})
+local mapScale = Instance.new("UIScale")
+mapScale.Parent = mapLabel
 
 -- 怪獣HP(サーバーから受け取った値だけを表示する。入力を吸わないよう全要素Active=false)
 local kaijuHpFrame = Instance.new("Frame")
@@ -182,6 +212,29 @@ local scoreLabel = makeLabel(hud, {
 local scoreScale = Instance.new("UIScale")
 scoreScale.Parent = scoreLabel
 
+local rampageLabel = makeLabel(hud, {
+	AnchorPoint = Vector2.new(1, 0),
+	Position = UDim2.new(1, -200, 0, 88),
+	Size = UDim2.fromOffset(220, 32),
+	Text = "RAMPAGE ×1.00",
+	TextColor3 = Color3.fromRGB(255, 180, 90),
+	TextXAlignment = Enum.TextXAlignment.Right,
+	Active = false,
+})
+local rampageScale = Instance.new("UIScale")
+rampageScale.Parent = rampageLabel
+
+local rampageFeedbackLabel = makeLabel(hud, {
+	AnchorPoint = Vector2.new(1, 0),
+	Position = UDim2.new(1, -200, 0, 122),
+	Size = UDim2.fromOffset(220, 28),
+	Text = "",
+	TextColor3 = Color3.fromRGB(255, 100, 100),
+	TextXAlignment = Enum.TextXAlignment.Right,
+	Visible = false,
+	Active = false,
+})
+
 -- 中央テロップ(「破壊せよ!」など)
 local telopLabel = makeLabel(hud, {
 	AnchorPoint = Vector2.new(0.5, 0.5),
@@ -241,6 +294,12 @@ local HUD_LAYOUT = {
 			Size = UDim2.fromOffset(120, 32),
 			TextXAlignment = Enum.TextXAlignment.Right,
 		},
+		map = {
+			AnchorPoint = Vector2.new(0, 0),
+			Position = UDim2.fromOffset(10, 8),
+			Size = UDim2.fromOffset(240, 36),
+			TextXAlignment = Enum.TextXAlignment.Left,
+		},
 		score = {
 			AnchorPoint = Vector2.new(1, 0),
 			Position = UDim2.new(1, -200, 0, 8),
@@ -253,12 +312,30 @@ local HUD_LAYOUT = {
 			Size = UDim2.fromOffset(220, 44),
 			TextXAlignment = Enum.TextXAlignment.Right,
 		},
+		rampage = {
+			AnchorPoint = Vector2.new(1, 0),
+			Position = UDim2.new(1, -200, 0, 88),
+			Size = UDim2.fromOffset(220, 32),
+			TextXAlignment = Enum.TextXAlignment.Right,
+		},
+		rampageFeedback = {
+			AnchorPoint = Vector2.new(1, 0),
+			Position = UDim2.new(1, -200, 0, 122),
+			Size = UDim2.fromOffset(220, 28),
+			TextXAlignment = Enum.TextXAlignment.Right,
+		},
 	},
 	compact = {
 		threat = {
 			AnchorPoint = Vector2.new(0, 0.5),
 			Position = UDim2.new(0, 10, 0, 30),
 			Size = UDim2.fromOffset(130, 30),
+			TextXAlignment = Enum.TextXAlignment.Left,
+		},
+		map = {
+			AnchorPoint = Vector2.new(0, 0),
+			Position = UDim2.new(0, 10, 0, 60),
+			Size = UDim2.fromOffset(220, 30),
 			TextXAlignment = Enum.TextXAlignment.Left,
 		},
 		score = {
@@ -271,6 +348,18 @@ local HUD_LAYOUT = {
 			AnchorPoint = Vector2.new(1, 0),
 			Position = UDim2.new(1, -10, 0, 46),
 			Size = UDim2.fromOffset(160, 36),
+			TextXAlignment = Enum.TextXAlignment.Right,
+		},
+		rampage = {
+			AnchorPoint = Vector2.new(1, 0),
+			Position = UDim2.new(1, -10, 0, 82),
+			Size = UDim2.fromOffset(180, 28),
+			TextXAlignment = Enum.TextXAlignment.Right,
+		},
+		rampageFeedback = {
+			AnchorPoint = Vector2.new(1, 0),
+			Position = UDim2.new(1, -10, 0, 112),
+			Size = UDim2.fromOffset(180, 26),
 			TextXAlignment = Enum.TextXAlignment.Right,
 		},
 	},
@@ -291,8 +380,11 @@ local function refreshHudLayout()
 	isCompactHud = compact
 	local layout = if compact then HUD_LAYOUT.compact else HUD_LAYOUT.wide
 	applyLabelProps(threatLabel, layout.threat)
+	applyLabelProps(mapLabel, layout.map)
 	applyLabelProps(scoreLabel, layout.score)
 	applyLabelProps(chainLabel, layout.chain)
+	applyLabelProps(rampageLabel, layout.rampage)
+	applyLabelProps(rampageFeedbackLabel, layout.rampageFeedback)
 end
 
 camera:GetPropertyChangedSignal("ViewportSize"):Connect(refreshHudLayout)
@@ -315,7 +407,7 @@ local SLOT_STROKE_COLOR = Color3.fromRGB(255, 220, 80)
 local slotsFrame = Instance.new("Frame")
 slotsFrame.AnchorPoint = Vector2.new(0.5, 1)
 slotsFrame.Position = UDim2.new(0.5, 0, 1, -12)
-slotsFrame.Size = UDim2.fromOffset(300, 90)
+slotsFrame.Size = UDim2.fromOffset(400, 90)
 slotsFrame.BackgroundTransparency = 1
 slotsFrame.Parent = hud
 local layout = Instance.new("UIListLayout")
@@ -325,6 +417,8 @@ layout.Padding = UDim.new(0, 10)
 layout.Parent = slotsFrame
 
 local slots = {} -- [weaponKey] = { button, overlay, cdText, stroke, sub }
+local selectedWeaponKey = nil
+local multiLockLaunchBtn = nil
 
 for _, key in Config.WeaponOrder do
 	local wc = Config.Weapons[key]
@@ -402,12 +496,19 @@ end
 -- 「黒背景+黄色太枠」と「通常背景+枠OFF」を同じ定数から切り替えるため、
 -- 型名やスロット番号のベタ書き分岐は行わない
 weaponEvents.WeaponSelected.Event:Connect(function(currentKey)
+	selectedWeaponKey = currentKey
 	for key, slot in slots do
 		local selected = key == currentKey
 		slot.stroke.Enabled = selected
 		slot.stroke.Thickness = if selected then SLOT_SELECTED_STROKE_THICKNESS else SLOT_NORMAL_STROKE_THICKNESS
 		slot.button.BackgroundColor3 = if selected then SLOT_SELECTED_COLOR else SLOT_NORMAL_COLOR
 		slot.button.BackgroundTransparency = if selected then SLOT_SELECTED_TRANSPARENCY else SLOT_NORMAL_TRANSPARENCY
+	end
+	if multiLockLaunchBtn then
+		multiLockLaunchBtn.Visible = currentKey == "MultiLockLauncher"
+	end
+	if currentKey == "MultiLockLauncher" then
+		lockLabel.Visible = true
 	end
 end)
 
@@ -445,6 +546,360 @@ detonateBtn.Activated:Connect(function()
 	end
 end)
 
+-- ロックマーカーはクライアント専用の表示Part。CanQuery=falseにして、
+-- 武器側のRaycastやサーバーのGameplay判定へ混入させない。
+local multiLockMarkerFolder = Instance.new("Folder")
+multiLockMarkerFolder.Name = "MultiLockMarkers"
+multiLockMarkerFolder.Parent = workspace
+local multiLockMarkers = {}
+local multiLockConfig = Config.Weapons.MultiLockLauncher
+local lockDisplayMax = if typeof(multiLockConfig) == "table"
+	then math.max(math.floor(tonumber(multiLockConfig.MaxLocks) or 24), 1)
+	else 24
+
+local function getMultiLockMarkerCount()
+	local count = 0
+	for _ in multiLockMarkers do
+		count += 1
+	end
+	return count
+end
+
+local function updateMultiLockLabel(maxLocks)
+	if typeof(maxLocks) == "number" and maxLocks > 0 then
+		lockDisplayMax = math.floor(maxLocks)
+	end
+	local count = getMultiLockMarkerCount()
+	lockLabel.Text = ("LOCK %d / %d"):format(count, lockDisplayMax)
+	lockLabel.Visible = selectedWeaponKey == "MultiLockLauncher" or count > 0
+end
+
+local function destroyMultiLockMarker(id)
+	local entry = multiLockMarkers[id]
+	if not entry then
+		return
+	end
+	multiLockMarkers[id] = nil
+	if entry.part and entry.part.Parent then
+		entry.part:Destroy()
+	end
+	updateMultiLockLabel()
+end
+
+local function clearMultiLockMarkers()
+	for id in multiLockMarkers do
+		destroyMultiLockMarker(id)
+	end
+	updateMultiLockLabel()
+end
+
+local function makeMultiLockMarker(data)
+	if data.id == nil or typeof(data.aimPosition) ~= "Vector3" then
+		return
+	end
+	destroyMultiLockMarker(data.id)
+	local part = Instance.new("Part")
+	part.Name = "MultiLockMarker"
+	part.Size = Vector3.new(0.2, 0.2, 0.2)
+	part.CFrame = CFrame.new(data.aimPosition)
+	part.Transparency = 1
+	part.Anchored = true
+	part.CanCollide = false
+	part.CanTouch = false
+	part.CanQuery = false
+	part.CastShadow = false
+	part.Parent = multiLockMarkerFolder
+
+	local billboard = Instance.new("BillboardGui")
+	billboard.Name = "LockBillboard"
+	billboard.Adornee = part
+	billboard.Size = UDim2.fromOffset(36, 36)
+	billboard.StudsOffset = Vector3.new(0, 1, 0)
+	billboard.AlwaysOnTop = true
+	billboard.MaxDistance = 500
+	billboard.Active = false
+	billboard.Parent = part
+	local label = makeLabel(billboard, {
+		Size = UDim2.fromScale(1, 1),
+		Text = "×",
+		TextColor3 = Color3.fromRGB(100, 225, 255),
+		Active = false,
+	})
+	label.TextStrokeTransparency = 0
+
+	multiLockMarkers[data.id] = {
+		part = part,
+		target = data.target,
+		surface = data.surface,
+		kind = data.kind,
+		aimPosition = data.aimPosition,
+	}
+	updateMultiLockLabel(data.max)
+end
+
+local function handleMultiLockHud(data)
+	if typeof(data) ~= "table" then
+		return
+	end
+	if data.action == "add" then
+		makeMultiLockMarker(data)
+	elseif data.action == "remove" then
+		destroyMultiLockMarker(data.id)
+	elseif data.action == "clear" then
+		clearMultiLockMarkers()
+	else
+		updateMultiLockLabel(data.max)
+	end
+end
+
+RunService.RenderStepped:Connect(function()
+	for id, entry in multiLockMarkers do
+		local position
+		if entry.kind == "building" then
+			position = if entry.surface
+				and entry.surface.Parent
+				and entry.surface:IsA("BasePart")
+				and entry.surface.CanQuery
+				and CollectionService:HasTag(entry.surface, "Destructible")
+				then entry.aimPosition
+				else nil
+		else
+			local target = entry.target
+			if target and target.Parent
+				and target:GetAttribute("Dead") ~= true
+				and target:GetAttribute("KaijuDead") ~= true
+				and target:GetAttribute("KaijuState") ~= "dead" then
+				local root = target.PrimaryPart or target:FindFirstChild("HumanoidRootPart", true)
+				position = if root and root:IsA("BasePart") then root.Position else nil
+			end
+		end
+		if not position then
+			destroyMultiLockMarker(id)
+		elseif entry.part.Parent then
+			entry.part.Position = position
+		end
+	end
+end)
+
+multiLockLaunchBtn = makeActionButton("発射", UDim2.new(1, -20, 1, -200),
+	UDim2.fromOffset(120, 60), Color3.fromRGB(45, 145, 190))
+multiLockLaunchBtn.Visible = selectedWeaponKey == "MultiLockLauncher"
+multiLockLaunchBtn.Activated:Connect(function()
+	weaponEvents.MultiLockLaunchRequest:Fire()
+end)
+
+--------------------------------------------------------------------
+-- DevTest UI(Studio + Config.DevTestMode.Enabled のときだけ生成)
+-- 入力値はすべてDevTest専用Remoteへ送り、サーバー側で再検証する。
+--------------------------------------------------------------------
+if devTestEnabled then
+	local devTestGui = Instance.new("ScreenGui")
+	devTestGui.Name = "DevTestGui"
+	devTestGui.ResetOnSpawn = false
+	devTestGui.Enabled = false
+	devTestGui.Parent = playerGui
+
+	local panel = Instance.new("ScrollingFrame")
+	panel.Name = "Panel"
+	panel.Position = UDim2.new(0, 16, 0, 110)
+	panel.Size = UDim2.new(0, 320, 1, -126)
+	panel.CanvasSize = UDim2.new(0, 0, 0, 0)
+	panel.ScrollingDirection = Enum.ScrollingDirection.Y
+	panel.ScrollBarThickness = 8
+	panel.Active = true
+	panel.ClipsDescendants = true
+	panel.BackgroundColor3 = Color3.fromRGB(25, 25, 30)
+	panel.BackgroundTransparency = 0.12
+	panel.BorderSizePixel = 0
+	panel.Parent = devTestGui
+	local panelCorner = Instance.new("UICorner")
+	panelCorner.CornerRadius = UDim.new(0, 8)
+	panelCorner.Parent = panel
+
+	local panelPadding = Instance.new("UIPadding")
+	panelPadding.PaddingTop = UDim.new(0, 10)
+	panelPadding.PaddingBottom = UDim.new(0, 10)
+	panelPadding.PaddingLeft = UDim.new(0, 10)
+	panelPadding.PaddingRight = UDim.new(0, 18)
+	panelPadding.Parent = panel
+
+	local panelLayout = Instance.new("UIListLayout")
+	panelLayout.SortOrder = Enum.SortOrder.LayoutOrder
+	panelLayout.Padding = UDim.new(0, 5)
+	panelLayout.Parent = panel
+
+	local nextLayoutOrder = 0
+	local function reserveLayoutOrder()
+		nextLayoutOrder += 1
+		return nextLayoutOrder
+	end
+
+	local function makeDevText(text, height, color)
+		local label = makeLabel(panel, {
+			Size = UDim2.new(1, 0, 0, height),
+			Text = text,
+			TextColor3 = color or Color3.new(1, 1, 1),
+			TextScaled = false,
+			TextSize = 16,
+			TextXAlignment = Enum.TextXAlignment.Left,
+		})
+		label.LayoutOrder = reserveLayoutOrder()
+		return label
+	end
+
+	local function makeDevInput(defaultText)
+		local box = Instance.new("TextBox")
+		box.Size = UDim2.new(1, 0, 0, 28)
+		box.BackgroundColor3 = Color3.fromRGB(55, 55, 65)
+		box.BorderSizePixel = 0
+		box.ClearTextOnFocus = false
+		box.Font = FONT
+		box.Text = defaultText
+		box.TextColor3 = Color3.new(1, 1, 1)
+		box.TextSize = 16
+		box.LayoutOrder = reserveLayoutOrder()
+		box.Parent = panel
+		local corner = Instance.new("UICorner")
+		corner.CornerRadius = UDim.new(0, 4)
+		corner.Parent = box
+		return box
+	end
+
+	local function makeDevButton(text, color)
+		local button = Instance.new("TextButton")
+		button.Size = UDim2.new(1, 0, 0, 30)
+		button.BackgroundColor3 = color or Color3.fromRGB(70, 95, 130)
+		button.BorderSizePixel = 0
+		button.Font = FONT
+		button.Text = text
+		button.TextColor3 = Color3.new(1, 1, 1)
+		button.TextSize = 15
+		button.LayoutOrder = reserveLayoutOrder()
+		button.Parent = panel
+		local corner = Instance.new("UICorner")
+		corner.CornerRadius = UDim.new(0, 4)
+		corner.Parent = button
+		return button
+	end
+
+	makeDevText("DEV TEST", 28, Color3.fromRGB(255, 220, 80))
+
+	makeDevText("KAIJU", 24, Color3.fromRGB(255, 180, 100))
+	local spawnKaijuButton = makeDevButton("SPAWN KAIJU", Color3.fromRGB(125, 75, 120))
+	spawnKaijuButton.Activated:Connect(function()
+		devTestRemote:FireServer("SpawnKaiju")
+	end)
+	local clearKaijuButton = makeDevButton("CLEAR KAIJU", Color3.fromRGB(110, 70, 95))
+	clearKaijuButton.Activated:Connect(function()
+		devTestRemote:FireServer("ClearKaiju")
+	end)
+
+	local enemyTypes = { "PoliceOfficer", "Soldier", "Sniper", "Tank" }
+	local enemyIndex = 1
+	makeDevText("Enemy", 22)
+	local enemyButton = makeDevButton("")
+	local function refreshEnemyButton()
+		enemyButton.Text = "Enemy: " .. enemyTypes[enemyIndex]
+	end
+	enemyButton.Activated:Connect(function()
+		enemyIndex = enemyIndex % #enemyTypes + 1
+		refreshEnemyButton()
+	end)
+	refreshEnemyButton()
+
+	makeDevText("Count", 22)
+	local countBox = makeDevInput("1")
+	makeDevText("Scale", 22)
+	local scaleBox = makeDevInput("1.00")
+	makeDevText("Attack Interval", 22)
+	local attackIntervalBox = makeDevInput("3.00")
+
+	local spawnButton = makeDevButton("SPAWN ENEMY", Color3.fromRGB(70, 135, 80))
+	spawnButton.Activated:Connect(function()
+		devTestRemote:FireServer("SpawnEnemy", {
+			typeName = enemyTypes[enemyIndex],
+			count = tonumber(countBox.Text),
+			scale = tonumber(scaleBox.Text),
+			attackInterval = tonumber(attackIntervalBox.Text),
+		})
+	end)
+
+	local aiStopButton = makeDevButton("AI STOP", Color3.fromRGB(130, 80, 70))
+	local aiStartButton = makeDevButton("AI START", Color3.fromRGB(70, 115, 80))
+	aiStopButton.Activated:Connect(function()
+		devTestRemote:FireServer("SetAI", false)
+	end)
+	aiStartButton.Activated:Connect(function()
+		devTestRemote:FireServer("SetAI", true)
+	end)
+
+	local clearButton = makeDevButton("CLEAR ENEMIES", Color3.fromRGB(110, 70, 70))
+	clearButton.Activated:Connect(function()
+		devTestRemote:FireServer("ClearEnemies")
+	end)
+
+	makeDevText("Weapon", 22)
+	local weaponNames = {}
+	for _, key in Config.WeaponOrder do
+		if Config.IsWeaponEnabled(key) then
+			table.insert(weaponNames, key)
+		end
+	end
+	local weaponIndex = 1
+	local weaponButton = makeDevButton("")
+	local function refreshWeaponButton()
+		weaponButton.Text = "Weapon: " .. (weaponNames[weaponIndex] or "Bazooka")
+	end
+	weaponButton.Activated:Connect(function()
+		if #weaponNames > 0 then
+			weaponIndex = weaponIndex % #weaponNames + 1
+			refreshWeaponButton()
+		end
+	end)
+	refreshWeaponButton()
+
+	makeDevText("Cooldown", 22)
+	local cooldownBox = makeDevInput("0.30")
+	makeDevText("Radius", 22)
+	local radiusBox = makeDevInput("12")
+
+	local applyButton = makeDevButton("APPLY WEAPON OVERRIDE", Color3.fromRGB(70, 110, 145))
+	local giveButton = makeDevButton("GIVE WEAPONS", Color3.fromRGB(75, 105, 80))
+	applyButton.Activated:Connect(function()
+		devTestRemote:FireServer("ApplyWeapon", {
+			weaponName = weaponNames[weaponIndex],
+			overrides = {
+				Cooldown = tonumber(cooldownBox.Text),
+				Radius = tonumber(radiusBox.Text),
+			},
+		})
+	end)
+	giveButton.Activated:Connect(function()
+		devTestRemote:FireServer("GiveWeapons")
+	end)
+
+	local resetButton = makeDevButton("RESET OVERRIDES", Color3.fromRGB(100, 85, 55))
+	resetButton.Activated:Connect(function()
+		devTestRemote:FireServer("ResetOverrides")
+	end)
+
+	local statusLabel = makeDevText("Ready", 18, Color3.fromRGB(170, 210, 170))
+	statusLabel.TextSize = 13
+	local function updateCanvasSize()
+		panel.CanvasSize = UDim2.fromOffset(0, panelLayout.AbsoluteContentSize.Y + 20)
+	end
+	panelLayout:GetPropertyChangedSignal("AbsoluteContentSize"):Connect(updateCanvasSize)
+	task.defer(updateCanvasSize)
+
+	devTestRemote.OnClientEvent:Connect(function(kind, data)
+		if kind == "Open" then
+			devTestGui.Enabled = true
+		elseif kind == "Status" and typeof(data) == "table" and typeof(data.text) == "string" then
+			statusLabel.Text = data.text
+		end
+	end)
+end
+
 --------------------------------------------------------------------
 -- リザルト画面
 --------------------------------------------------------------------
@@ -472,7 +927,7 @@ makeLabel(resultBg, {
 local rowsFrame = Instance.new("Frame")
 rowsFrame.AnchorPoint = Vector2.new(0.5, 0)
 rowsFrame.Position = UDim2.new(0.5, 0, 0.16, 0)
-rowsFrame.Size = UDim2.new(0.7, 0, 0, 200)
+rowsFrame.Size = UDim2.new(0.9, 0, 0, 230)
 rowsFrame.BackgroundTransparency = 1
 rowsFrame.Parent = resultBg
 local rowsLayout = Instance.new("UIListLayout")
@@ -488,12 +943,16 @@ local function addRow(text, height, color)
 	})
 end
 
+-- Result表示とBATTLE HUDの両方から参照する表示ヘルパー(実装は通知処理側で定義)
+local formatDestructionPercent
+local getRampageStartMultiplier
+
 -- 建物リスト(破壊率1%以上のみ・降順・3列グリッド)。128棟のうち十数棟しか
 -- 入らなかった旧レイアウトの問題を解消するため、ScrollingFrame + UIGridLayoutに変更する
 local buildingScroll = Instance.new("ScrollingFrame")
 buildingScroll.AnchorPoint = Vector2.new(0.5, 0)
-buildingScroll.Position = UDim2.new(0.5, 0, 0.4, 0)
-buildingScroll.Size = UDim2.new(0.85, 0, 0.4, 0)
+buildingScroll.Position = UDim2.new(0.5, 0, 0.52, 0)
+buildingScroll.Size = UDim2.new(0.85, 0, 0.29, 0)
 buildingScroll.BackgroundTransparency = 1
 buildingScroll.BorderSizePixel = 0
 buildingScroll.ScrollBarThickness = 6
@@ -565,11 +1024,33 @@ local function showResult(data)
 			child:Destroy()
 		end
 	end
+	local mapStats = data.mapStats or {}
+	local playerStats = data.playerStats or {}
+	-- MAP破壊率を主結果として表示し、Player/NPCの内訳も同じ分母で示す。
+	addRow(("MAP DESTROYED %d%%"):format(formatDestructionPercent(mapStats.totalRate)), 30, Color3.fromRGB(120, 230, 255))
+	addRow(("YOU %d%%   PLAYERS %d%%   NPC %d%%"):format(
+		formatDestructionPercent(playerStats.destructionRate),
+		formatDestructionPercent(mapStats.playerRate),
+		formatDestructionPercent(mapStats.npcRate)), 28, Color3.fromRGB(210, 210, 210))
+	addRow(("SCORE %d   MAX RAMPAGE ×%.2f"):format(
+		playerStats.score or 0,
+		playerStats.maxRampage or getRampageStartMultiplier()), 30)
+	addRow(("END RAMPAGE ×%.2f   HITS TAKEN %d   DESTROYED BLOCKS %d"):format(
+		playerStats.rampage or getRampageStartMultiplier(),
+		playerStats.hitsTaken or 0,
+		playerStats.destroyedBlocks or 0), 30)
+
 	-- 順位。撃破数は0でも「(敵 0)」と出す(欠落と区別できないようにするため)。
 	-- Step5-1で兵士もkillCountsに入るようになったため「警察」から「敵」に変更(§30)
-	for rank, entry in ipairs(data.ranking) do
+	for rank, entry in ipairs(data.ranking or {}) do
 		local color = if rank == 1 then Color3.fromRGB(255, 220, 80) else nil
-		addRow(("%d位  %s  %d点  (敵 %d)"):format(rank, entry.name, entry.score, entry.kills or 0), 36, color)
+		addRow(("%d位  %s  %d点  (敵 %d / blocks %d / %d%%)"):format(
+			rank,
+			entry.name,
+			entry.score,
+			entry.kills or 0,
+			entry.destroyedBlocks or 0,
+			formatDestructionPercent(entry.destructionRate)), 36, color)
 	end
 	-- サマリー行
 	local summary = data.buildingSummary or { destroyedCount = 0, totalCount = 0, overallRate = 0 }
@@ -582,7 +1063,7 @@ local function showResult(data)
 			child:Destroy()
 		end
 	end
-	local sorted = table.clone(data.buildings)
+	local sorted = table.clone(data.buildings or {})
 	table.sort(sorted, function(a, b)
 		return a.rate > b.rate
 	end)
@@ -777,6 +1258,76 @@ local function flashDamageVignette()
 	TweenService:Create(damageVignette, TweenInfo.new(0.35), { BackgroundTransparency = 1 }):Play()
 end
 
+formatDestructionPercent = function(rate)
+	local normalized = math.clamp(tonumber(rate) or 0, 0, 1)
+	return math.floor(normalized * 100 + 0.5)
+end
+
+getRampageStartMultiplier = function()
+	local rampage = Config.Rampage
+	return math.max(tonumber(rampage and rampage.StartMultiplier) or 1, 1)
+end
+
+local function updateMapStats(data)
+	if typeof(data) ~= "table" then
+		return
+	end
+	mapLabel.Text = ("MAP DESTROYED %d%%"):format(formatDestructionPercent(data.totalRate))
+	mapScale.Scale = 1.12
+	TweenService:Create(mapScale, TweenInfo.new(0.15), { Scale = 1 }):Play()
+end
+
+local rampageFeedbackToken = 0
+local function clearRampageFeedback()
+	rampageFeedbackToken += 1
+	rampageFeedbackLabel.Visible = false
+	rampageFeedbackLabel.Text = ""
+	rampageFeedbackLabel.TextTransparency = 0
+end
+
+local function showRampageFeedback(delta)
+	if delta >= 0 then
+		return
+	end
+	rampageFeedbackToken += 1
+	local token = rampageFeedbackToken
+	rampageFeedbackLabel.Text = ("RAMPAGE %+.2f"):format(delta)
+	rampageFeedbackLabel.TextColor3 = Color3.fromRGB(255, 100, 100)
+	rampageFeedbackLabel.TextTransparency = 0
+	rampageFeedbackLabel.Visible = true
+	task.delay(0.55, function()
+		if rampageFeedbackToken ~= token then
+			return
+		end
+		local fade = TweenService:Create(rampageFeedbackLabel, TweenInfo.new(0.2), { TextTransparency = 1 })
+		fade.Completed:Connect(function()
+			if rampageFeedbackToken == token then
+				rampageFeedbackLabel.Visible = false
+			end
+		end)
+		fade:Play()
+	end)
+end
+
+local function updateRampage(data)
+	if typeof(data) ~= "table" then
+		return
+	end
+	local value = math.max(tonumber(data.value) or getRampageStartMultiplier(), 1)
+	rampageLabel.Text = ("RAMPAGE ×%.2f"):format(value)
+	local delta = tonumber(data.delta) or 0
+	if delta < 0 then
+		rampageLabel.TextColor3 = Color3.fromRGB(255, 100, 100)
+		showRampageFeedback(delta)
+	else
+		rampageLabel.TextColor3 = Color3.fromRGB(255, 180, 90)
+	end
+	if delta ~= 0 then
+		rampageScale.Scale = if delta < 0 then 1.15 else 1.08
+		TweenService:Create(rampageScale, TweenInfo.new(0.2), { Scale = 1 }):Play()
+	end
+end
+
 local function updateKaijuHP(data)
 	if typeof(data) ~= "table" then
 		return
@@ -813,8 +1364,29 @@ end
 
 --------------------------------------------------------------------
 -- 敵の方向インジケータ(画面端の▲)。サーバー通信を増やさず、
--- workspace.Enemiesを直接読んで自分で計算する(読み取り専用。サーバー権威の原則は変えない)
+-- workspace.Enemies/KaijuRuntimeを直接読んで自分で計算する(読み取り専用。サーバー権威の原則は変えない)
 --------------------------------------------------------------------
+local indicatorsAllowed = true
+
+local function getKaijuMarkerPosition(model, heightOffset)
+	local head = model:FindFirstChild("Head", true)
+	if head and head:IsA("BasePart") then
+		return head.Position + Vector3.new(0, heightOffset, 0)
+	end
+
+	local root = model:FindFirstChild("HumanoidRootPart", true)
+	if root and root:IsA("BasePart") then
+		return root.Position + Vector3.new(0, heightOffset, 0)
+	end
+
+	local ok, boundsCFrame, boundsSize = pcall(function()
+		return model:GetBoundingBox()
+	end)
+	if ok and typeof(boundsCFrame) == "CFrame" and typeof(boundsSize) == "Vector3" then
+		return boundsCFrame.Position + Vector3.new(0, boundsSize.Y * 0.5 + heightOffset, 0)
+	end
+	return nil
+end
 do
 	local indicatorCfg = Config.Threat.Indicator
 	if indicatorCfg and indicatorCfg.Enabled then
@@ -832,11 +1404,25 @@ do
 		end
 
 		local function updateIndicators()
-			local enemiesFolder = workspace:FindFirstChild("Enemies")
-			if not enemiesFolder then
+			local function hidePool()
 				for _, arrow in pool do
 					arrow.Visible = false
 				end
+			end
+			if not indicatorsAllowed then
+				hidePool()
+				return
+			end
+
+			local enemiesFolder = workspace:FindFirstChild("Enemies")
+			local kaijuConfig = if typeof(Config.Kaiju) == "table" then Config.Kaiju else {}
+			local kaijuRuntimeName = if typeof(kaijuConfig.RuntimeFolderName) == "string"
+				and kaijuConfig.RuntimeFolderName ~= ""
+				then kaijuConfig.RuntimeFolderName
+				else "KaijuRuntime"
+			local kaijuFolder = workspace:FindFirstChild(kaijuRuntimeName)
+			if not enemiesFolder and not kaijuFolder then
+				hidePool()
 				return
 			end
 
@@ -844,22 +1430,45 @@ do
 			local center = Vector2.new(viewportSize.X / 2, viewportSize.Y / 2)
 			local candidates = {}
 
-			for _, model in enemiesFolder:GetChildren() do
-				-- 死体(Dead=true)には▲を出さない。生成途中(PrimaryPart未設定)も除外。
-				-- ヘリ降下中(Deploying=true。Step5-1)も対象外にする(「!」と同じく降下完了まで隠す)
-				if model:GetAttribute("Dead") ~= true and model:GetAttribute("Deploying") ~= true
-					and model.PrimaryPart then
-					local pos = model.PrimaryPart.Position
-					local dist = (camera.CFrame.Position - pos).Magnitude
-					if dist <= indicatorCfg.MaxDistance then
-						local screenPos, onScreen = camera:WorldToViewportPoint(pos)
-						-- 画面内は頭上マーカーが担当する。役割を重複させないため画面外だけ対象にする
-						if not onScreen then
-							table.insert(candidates, { screenPos = screenPos, dist = dist })
+			local kaijuMarkerConfig = if typeof(kaijuConfig.Marker) == "table" then kaijuConfig.Marker else {}
+			local kaijuHeightOffset = kaijuMarkerConfig.HeightOffset
+			if typeof(kaijuHeightOffset) ~= "number"
+				or kaijuHeightOffset ~= kaijuHeightOffset
+				or kaijuHeightOffset == math.huge
+				or kaijuHeightOffset == -math.huge then
+				kaijuHeightOffset = 0
+			end
+
+			local function appendCandidates(folder, isKaiju)
+				if not folder then
+					return
+				end
+				for _, model in folder:GetChildren() do
+					if model:IsA("Model") then
+						local dead = if isKaiju
+							then model:GetAttribute("KaijuDead") == true
+								or model:GetAttribute("KaijuState") == "dead"
+							else model:GetAttribute("Dead") == true
+						if not dead and model:GetAttribute("Deploying") ~= true then
+							local pos = if isKaiju
+								then getKaijuMarkerPosition(model, kaijuHeightOffset)
+								else if model.PrimaryPart then model.PrimaryPart.Position else nil
+							if pos then
+								local dist = (camera.CFrame.Position - pos).Magnitude
+								if dist <= indicatorCfg.MaxDistance then
+									local screenPos, onScreen = camera:WorldToViewportPoint(pos)
+									-- 画面内は頭上マーカーが担当する。役割を重複させないため画面外だけ対象にする
+									if not onScreen then
+										table.insert(candidates, { screenPos = screenPos, dist = dist })
+									end
+								end
+							end
 						end
 					end
 				end
 			end
+			appendCandidates(enemiesFolder, false)
+			appendCandidates(kaijuFolder, true)
 
 			table.sort(candidates, function(a, b)
 				return a.dist < b.dist
@@ -910,7 +1519,14 @@ end
 -- ラウンド状態と残り時間
 local lastState = nil
 remotes:WaitForChild("RoundState").OnClientEvent:Connect(function(state, timeLeft)
-	if state == "LOBBY" or state == "RESULT" then
+	indicatorsAllowed = state ~= "LOBBY" and state ~= "RESULT"
+	if state ~= "BATTLE" and state ~= "FINAL" then
+		clearMultiLockMarkers()
+		if multiLockLaunchBtn then
+			multiLockLaunchBtn.Visible = false
+		end
+	end
+	if state == "LOBBY" or state == "RESULT" or state == "DEVTEST" then
 		kaijuHpFrame.Visible = false
 	end
 	if state == "BATTLE" then
@@ -919,6 +1535,8 @@ remotes:WaitForChild("RoundState").OnClientEvent:Connect(function(state, timeLef
 		timerLabel.Text = ("FINAL %d:%02d"):format(timeLeft // 60, timeLeft % 60)
 	elseif state == "LOBBY" then
 		timerLabel.Text = ("開始まで %d"):format(timeLeft)
+	elseif state == "DEVTEST" then
+		timerLabel.Text = "DEV TEST"
 	else
 		-- RESULTは「次へ」ボタンによる手動進行になったため、カウントダウン数字は意味を持たない
 		timerLabel.Text = "リザルト"
@@ -928,11 +1546,17 @@ remotes:WaitForChild("RoundState").OnClientEvent:Connect(function(state, timeLef
 		lastState = state
 		if state == "LOBBY" then
 			resultGui.Enabled = false
+			mapLabel.Text = "MAP DESTROYED 0%"
+			clearRampageFeedback()
+			updateRampage({ value = getRampageStartMultiplier(), delta = 0, reset = true })
 			showTelop("まもなく開始…", 4)
 		elseif state == "BATTLE" then
+			clearRampageFeedback()
 			showTelop("破壊せよ!", 2.5)
 		elseif state == "FINAL" then
 			showTelop("FINAL PHASE  KAIJU", 3)
+		elseif state == "DEVTEST" then
+			showTelop("DEV TEST", 2)
 		elseif state == "RESULT" then
 			showTelop("終了!", 2.5)
 		end
@@ -953,6 +1577,10 @@ end)
 remotes:WaitForChild("Hud").OnClientEvent:Connect(function(kind, data)
 	if kind == "time" then
 		onTimeChanged(data.delta, data.reason)
+	elseif kind == "map" then
+		updateMapStats(data)
+	elseif kind == "rampage" then
+		updateRampage(data)
 	elseif kind == "hit" then
 		flashDamageVignette()
 	elseif kind == "threat" then
@@ -968,6 +1596,8 @@ remotes:WaitForChild("Hud").OnClientEvent:Connect(function(kind, data)
 		end
 	elseif kind == "kaijuHP" then
 		updateKaijuHP(data)
+	elseif kind == "multiLock" then
+		handleMultiLockHud(data)
 	elseif kind == "final" then
 		showTelop("FINAL PHASE  KAIJU", 3)
 	end

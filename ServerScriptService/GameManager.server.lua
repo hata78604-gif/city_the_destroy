@@ -4,7 +4,7 @@
 -- 種別: Script(通常のサーバースクリプト)
 --
 -- ラウンド進行の司令塔。
--- ロビー(3秒・マップ生成) → バトル(基礎時間。敵撃破・建物全壊で増減) →
+-- ロビー(3秒・マップ生成) → バトル(固定制限時間・MAP破壊率で進行) →
 -- 条件付きFINAL(固定時間。怪獣撃破またはTIME UP) → リザルト(「次へ」ボタンで手動進行。最大ResultTimeout秒) → 繰り返し。
 -- RemoteEvent の自動生成と、各モジュールの初期化・接続もここで行う。
 --------------------------------------------------------------------
@@ -12,6 +12,7 @@
 local Players = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local ServerScriptService = game:GetService("ServerScriptService")
+local RunService = game:GetService("RunService")
 
 local Config = require(ReplicatedStorage:WaitForChild("Config"))
 local Modules = ServerScriptService:WaitForChild("Modules")
@@ -24,6 +25,7 @@ local RoundClock = require(Modules.RoundClock)
 local EnemyManager = require(Modules.EnemyManager)
 local ThreatManager = require(Modules.ThreatManager)
 local KaijuManager = require(Modules.KaijuManager)
+local DevTestService = require(Modules.DevTestService)
 
 -- ライティングと地形(Terrain草地)。ラウンドとは無関係に起動時1回だけ
 VisualSetup.Setup()
@@ -43,10 +45,15 @@ end
 remotesFolder.Parent = ReplicatedStorage
 
 local roundState = "LOBBY"
+local devTestActive = RunService:IsStudio()
+	and typeof(Config.DevTestMode) == "table"
+	and Config.DevTestMode.Enabled == true
 local finalPhaseStarted = false
 local finalPhaseResolved = false
 local finalResultReason = nil
 local finalResultAt = nil
+local battleStartedAt = nil
+local finalReachedAt = nil
 
 local function isActivePlayer(player)
 	return typeof(player) == "Instance" and player:IsA("Player") and player.Parent == Players
@@ -92,6 +99,9 @@ local function resolveFinalPhase(reason, attacker)
 	finalResultReason = reason
 	local remaining = RoundClock.Remaining()
 	RoundClock.EndFinalPhase()
+	-- FINAL解決後の死亡演出・Result待機中に、遅延した武器callbackが
+	-- 新しい破壊・Score・RAMPAGEを追加しないよう、この時点で受付と弾を止める。
+	WeaponServer.SetRoundActive(false)
 
 	if reason == "defeated" then
 		-- KaijuManagerはこの通知前にDamage ScoreとDefeat Scoreを加算済み。
@@ -119,6 +129,7 @@ local function beginFinalPhase()
 		return false
 	end
 	finalPhaseStarted = true
+	finalReachedAt = if battleStartedAt then os.clock() - battleStartedAt else nil
 
 	local finalConfig = getFinalConfig()
 	local duration = math.max(tonumber(finalConfig.Duration) or 0, 0)
@@ -146,11 +157,17 @@ end
 WeaponServer.Init(remotes, DestructionManager)
 DestructionManager.Init({
 	addScore = WeaponServer.AddScore,
-	addTime = RoundClock.Add, -- 全壊時のタイム報酬用(Step1で追加)
+	addTime = RoundClock.Add, -- 旧API互換。現行ゲームプレイでは呼び出さない
+	getRampage = WeaponServer.GetPlayerRampage,
+	recordPlayerBlock = WeaponServer.RecordPlayerBlock,
+	addRampage = WeaponServer.AddRampage,
 	-- 爆風の影響を受けるモジュール群。Explode終了時に全員へctxがそのまま渡る。
 	blastListeners = { NPCManager.OnExplosion, EnemyManager.OnExplosion, KaijuManager.OnExplosion },
 	effectRemote = remotes.Effect,
 	hudRemote = remotes.Hud,
+	onMapChanged = function()
+		ThreatManager.Evaluate()
+	end,
 })
 NPCManager.Init({
 	addScore = WeaponServer.AddScore,
@@ -174,6 +191,7 @@ RoundClock.Init({
 EnemyManager.Init({
 	addScore = WeaponServer.AddScore,
 	addTime = RoundClock.Add,
+	applyRampagePenalty = WeaponServer.ApplyRampagePenalty,
 	getRemaining = RoundClock.Remaining,
 	effectRemote = remotes.Effect,
 	hudRemote = remotes.Hud,
@@ -184,6 +202,7 @@ EnemyManager.Init({
 })
 KaijuManager.Init({
 	addTime = RoundClock.Add,
+	applyRampagePenalty = WeaponServer.ApplyRampagePenalty,
 	explode = DestructionManager.Explode,
 	addScore = WeaponServer.AddScore,
 	hudRemote = remotes.Hud,
@@ -192,7 +211,7 @@ KaijuManager.Init({
 	end,
 })
 ThreatManager.Init({
-	getScore = WeaponServer.GetTotalScore,
+	getMapDestructionRate = DestructionManager.GetMapDestructionRate,
 	enemies = EnemyManager,
 	kaiju = KaijuManager,
 	hudRemote = remotes.Hud,
@@ -201,6 +220,7 @@ ThreatManager.Init({
 		beginFinalPhase()
 	end,
 })
+DevTestService.Init(remotes, EnemyManager, WeaponServer, KaijuManager)
 
 --------------------------------------------------------------------
 -- プレイヤーの入退室
@@ -217,14 +237,25 @@ local function onPlayerAdded(player)
 		then math.ceil(RoundClock.Remaining())
 		else 0
 	remotes.RoundState:FireClient(player, roundState, timeLeft)
+	if roundState == "BATTLE" or roundState == "FINAL" then
+		remotes.Hud:FireClient(player, "map", DestructionManager.GetRoundStats())
+		remotes.Hud:FireClient(player, "rampage", {
+			value = WeaponServer.GetPlayerRampage(player),
+			delta = 0,
+			reset = true,
+		})
+	end
 
 	-- リスポーン時、バトル中なら武器を配り直す(Backpackは死ぬと空になるため)
 	player.CharacterAdded:Connect(function()
-		if roundState == "BATTLE" or roundState == "FINAL" then
+		if roundState == "BATTLE" or roundState == "FINAL" or roundState == "DEVTEST" then
 			task.wait(0.5) -- Backpackの準備を待つ
 			WeaponServer.GiveTools(player)
 		end
 	end)
+	if devTestActive then
+		DevTestService.OpenForPlayer(player)
+	end
 end
 
 Players.PlayerAdded:Connect(onPlayerAdded)
@@ -310,31 +341,60 @@ local function respawnPlayersForRound()
 	end
 end
 
+-- 新しいMAPと、各Managerが使う同一のMapContextを準備する共通入口。
+-- 通常ラウンドとDevTestでMAPロード処理を複製しない。
+local function prepareMap()
+	WeaponServer.SetRoundActive(false)
+	WeaponServer.RemoveToolsFromAll()
+	NPCManager.Clear()
+	KaijuManager.Clear()
+	ThreatManager.Clear()
+	EnemyManager.Clear()
+	DestructionManager.ClearAllDebris()
+	DestructionManager.ClearAllRubble()
+
+	local mapContext = MapRuntime.LoadRound()
+	KaijuManager.SetMapContext(mapContext)
+	WeaponServer.SetMapContext(mapContext)
+	EnemyManager.SetMapContext(mapContext)
+	NPCManager.SetMapContext(mapContext)
+	DestructionManager.SetBuildings(mapContext.buildings)
+	return mapContext, mapContext.buildings
+end
+
 task.wait(3) -- 起動直後のロード猶予
 
-while true do
+if devTestActive then
+	-- DevTestは通常ラウンドの開始前に一度だけMAPを準備して待機する。
+	roundState = "DEVTEST"
+	finalPhaseStarted = false
+	finalPhaseResolved = false
+	finalResultReason = nil
+	finalResultAt = nil
+	battleStartedAt = nil
+	finalReachedAt = nil
+	RoundClock.EndFinalPhase()
+	local mapContext = prepareMap()
+	respawnPlayersForRound()
+	WeaponServer.ResetScores()
+	WeaponServer.SetRoundActive(true)
+	WeaponServer.GiveToolsToAll()
+	EnemyManager.SetAggressive(false)
+	WeaponServer.ClearDevOverrides()
+	DevTestService.Start(mapContext)
+	remotes.RoundState:FireAllClients("DEVTEST", 0)
+else
+	while true do
 	-- 1) ロビー: 前ラウンドの後片付け → 固定MAPを原本から再ロード
 	roundState = "LOBBY"
 	finalPhaseStarted = false
 	finalPhaseResolved = false
 	finalResultReason = nil
 	finalResultAt = nil
+	battleStartedAt = nil
+	finalReachedAt = nil
 	RoundClock.EndFinalPhase()
-	WeaponServer.SetRoundActive(false)
-	WeaponServer.RemoveToolsFromAll()
-	NPCManager.Clear()
-	KaijuManager.Clear() -- 旧世代の移動を無効化し、前ラウンドのCloneをMAP再生成前に完全削除する
-	ThreatManager.Clear() -- ★Step2で追加(段階を0に戻す)
-	EnemyManager.Clear() -- ★Step2で追加(NPCManager.Clear()の隣。敵モデル・攻撃タイマー全消去)
-	DestructionManager.ClearAllDebris()
-	DestructionManager.ClearAllRubble()
-	local mapContext = MapRuntime.LoadRound()
-	KaijuManager.SetMapContext(mapContext) -- LoadRound直後に経路値をコピーし、後続Managerから独立させる
-	local buildings = mapContext.buildings
-	WeaponServer.SetMapContext(mapContext) -- boundsの数値だけをコピーし、エアストライクの地表面Raycastへ渡す
-	EnemyManager.SetMapContext(mapContext) -- 毎ラウンドCloneされた新しいMapContextを設定する
-	NPCManager.SetMapContext(mapContext) -- NPCSpawnの座標コピーだけを保持し、旧Map Instanceは保持しない
-	DestructionManager.SetBuildings(buildings)
+	local _, buildings = prepareMap()
 	respawnPlayersForRound() -- 新MAPのSpawnLocationを使って前ラウンドのCharacter状態をリセット
 	runPhase("LOBBY", Config.Round.LobbyTime)
 
@@ -345,7 +405,7 @@ while true do
 	WeaponServer.SetRoundActive(true)
 	WeaponServer.GiveToolsToAll()
 	NPCManager.Start()
-	local battleStartedAt = os.clock() -- スコア内訳ログ(Step4d §6)の経過秒数計測用
+	battleStartedAt = os.clock() -- スコア内訳・RAMPAGE測定用の経過秒数計測起点
 	RoundClock.Start(Config.Round.BattleTime)
 	ThreatManager.Start() -- ★Step2で追加(ResetScoresより後)
 	runBattlePhase()
@@ -361,11 +421,10 @@ while true do
 	WeaponServer.SetRoundActive(false)
 	WeaponServer.RemoveToolsFromAll()
 	NPCManager.Stop()
-	-- スコア内訳ログ(測定用。Step4d §6)。タイム増減で終了時刻が変わるため、
-	-- 経過秒数を添えないと「速かったのか遅かったのか」が内訳だけでは判断できない
+	-- スコア内訳と新ゲームループの測定値をログへ出す。
 	WeaponServer.LogScoreBreakdown(os.clock() - battleStartedAt)
 
-	-- ランキングに撃破数をマージする(WeaponServer.GetRanking()自体の戻り値は変更しない)。
+	-- ランキングに撃破数とプレイヤー破壊率をマージする。
 	-- EnemyManager.GetKillCounts()はPlayerオブジェクトをキーに持つため、userIdで突き合わせる。
 	-- DisplayNameは一意ではないため使わない(重複すると撃破数が別人に合算される)
 	local ranking = WeaponServer.GetRanking()
@@ -377,31 +436,48 @@ while true do
 		entry.kills = killsByUserId[entry.userId] or 0
 	end
 
-	-- 建物の全体破壊率を集計する。buildingsはLOBBYで生成した際のこのループのローカル変数で、
-	-- DestructionManagerが同じテーブルを直接書き換えているため、ここで読んでも最新の値が見える
-	-- (DestructionManager.SetBuildings(info)は参照を持つだけでコピーしないため)。
-	-- 建物が1棟も生成されなかった異常時のゼロ除算を避けるため、totalBlocks==0なら0%とする
-	local totalDestroyed, totalBlocks, destroyedCount = 0, 0, 0
+	local mapStats = DestructionManager.GetRoundStats()
+	local totalBlocks = mapStats.totalBlocks or 0
+	for _, entry in ranking do
+		entry.destructionRate = if totalBlocks > 0
+			then entry.destroyedBlocks / totalBlocks
+			else 0
+	end
+
+	-- 建物単位の既存サマリーは維持し、MAP破壊率の正本はmapStatsに統一する。
+	local destroyedCount = 0
 	for _, building in ipairs(buildings) do
-		totalDestroyed += building.destroyed
-		totalBlocks += building.total
 		if building.total > 0 and building.destroyed / building.total >= 0.01 then
 			destroyedCount += 1
 		end
 	end
-	local overallRate = if totalBlocks > 0 then math.floor(totalDestroyed / totalBlocks * 100) else 0
+	local overallRate = math.floor((mapStats.totalRate or 0) * 100 + 0.5)
+	WeaponServer.LogRoundStats(mapStats, finalReachedAt)
 
 	roundState = "RESULT"
 	-- 1回だけ送信する(毎秒送信はしない。手動進行になったためカウントダウンの意味を持たない)
 	remotes.RoundState:FireAllClients("RESULT", 0)
-	remotes.Result:FireAllClients({
+	local resultData = {
 		ranking = ranking,
 		buildings = DestructionManager.GetBuildingStats(),
+		mapStats = mapStats,
 		buildingSummary = {
 			destroyedCount = destroyedCount,
 			totalCount = #buildings,
 			overallRate = overallRate,
 		},
-	})
+		finalResultReason = finalResultReason,
+		finalReachedAt = finalReachedAt,
+	}
+	for _, player in Players:GetPlayers() do
+		local payload = table.clone(resultData)
+		local playerStats = WeaponServer.GetPlayerRoundStats(player)
+		playerStats.destructionRate = if totalBlocks > 0
+			then playerStats.destroyedBlocks / totalBlocks
+			else 0
+		payload.playerStats = playerStats
+		remotes.Result:FireClient(player, payload)
+	end
 	waitForReady()
+end
 end

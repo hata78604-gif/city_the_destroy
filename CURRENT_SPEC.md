@@ -7,6 +7,7 @@
 `ReplicatedStorage/Config.lua` / `ServerScriptService/GameManager.server.lua` /
 `ServerScriptService/Modules/MapRuntime.lua` / `CityGenerator.lua` / `DestructionManager.lua` / `NPCManager.lua` / `WeaponServer.lua` /
 `ServerScriptService/Modules/KaijuManager.lua` /
+`ServerScriptService/Modules/DevTestService.lua` /
 `StarterPlayer/StarterPlayerScripts/WeaponClient.client.lua` / `EffectsClient.client.lua` / `UIController.client.lua`
 
 `archive/` 内の `roblox_destruction_game_spec.md`・`city_expansion_spec.md`・`visual_upgrade_spec.md`・
@@ -17,6 +18,167 @@
 対象が「(プロジェクト名)」であることを確認してから
 set_active_studio で明示的に指定すること。
 途中で別のツールを挟んだ後も、再度確認すること。
+
+---
+
+## 0-1. 現行ランタイムスナップショット（2026-09-02）
+
+この節は、現在ローカルにある実装とStudio Play QAの結果を同期した**現行仕様の正本**である。
+後段のPhase節には実装履歴と当時の設計メモが残っているため、現在値・現在挙動が食い違う場合は
+この節を優先する。今回の同期ではバランス値を変更していない。
+
+### 現行ゲームループ
+
+- LOBBYでマップと各Managerをラウンド単位で初期化し、BATTLEを開始する。
+- 通常BATTLEの開始時計は Config.Round.BattleTime = 300 秒（05:00）。RoundClockが
+  サーバー権威の残り時間をdeadline方式で管理し、通常BATTLE中は自然なカウントダウンだけを行う。
+- Threatの入力はScoreではなく、全Destructible blockのTotal MAP破壊率である。
+  DestructionManagerのGetMapDestructionRateをThreatManagerが定期評価する。
+- 現在のConfig.Threat.Stagesの閾値は順に5%、12%、20%、30%。20%でTank段階、
+  30%でFINAL段階へ進む。閾値はConfig.Threat.Stagesだけで変更できる。
+- FINAL開始時は通常BATTLE残り時間を引き継がず、RoundClock.BeginFinalPhaseへ
+  Config.FinalPhase.Duration = 120 秒を渡す。FINALの既存終了処理（怪獣撃破またはFINAL TIME UP
+  からRESULT）を維持する。
+- 通常BATTLEが300秒でTIME UPし、FINAL閾値へ未到達ならFINALを開始せずRESULTへ進む。
+- FINAL開始通知とFINAL解決は、それぞれラウンド内で1回だけ実行する。閾値を一度の爆発で
+  複数段階跨いだ場合も、ThreatManagerは該当段階を順に処理し、FINAL開始callbackを重複させない。
+
+### MAP破壊率と破壊帰属
+
+MapRuntimeがラウンド開始時にDestructibleタグを付けた破壊可能BasePartを登録し、
+DestructionManagerが各blockを一度だけ破壊済みとして確定する。同じblockを後続爆発が
+巻き込んでもカウンタは増えない。
+
+- TotalBlocks = ラウンド開始時に登録した全Destructible block数
+- PlayerDestroyed = attackerがPlayerである破壊済みblock数
+- NPCDestroyed = attackerがnilである破壊済みblock数
+- TotalDestroyed = PlayerDestroyed + NPCDestroyed
+- TotalMapDestructionRate = TotalDestroyed / TotalBlocks（TotalBlocksが0なら0）
+- PlayerDestructionRate = PlayerDestroyed / TotalBlocks
+- NPCDestructionRate = NPCDestroyed / TotalBlocks
+
+建物単位では既存の building.destroyed / building.total を引き続き使用する。
+Player帰属の建物破壊では既存の building.credit[player] を再利用してプレイヤー別貢献数を
+保持する。プレイヤー別のDestroyed blocksとDestruction rateはWeaponServerのラウンド統計・
+ランキングへ渡す。NPC帰属はattacker=nilで統一し、Tank、Kaiju、その他Enemyによる建物破壊を
+PlayerDestroyedへ入れず、Total/NPCだけへ加算する。
+
+### RAMPAGEとScore
+
+RAMPAGEはWeaponServerがPlayerごとのラウンド状態として保持する。Config.Rampageの現行値は
+次のとおりで、MaximumMultiplier = nil のため上限なしである。
+
+- Enabled = true
+- StartMultiplier = 1.00
+- MinimumMultiplier = 1.00
+- GainPerBlock = 0.01
+- Penalties: PoliceShot 0.25、SoldierShot 0.05、SniperShot 0.50、
+  TankShell 1.00、KaijuFireball 1.50、KaijuTailSpin 1.00
+
+プレイヤーがDestructible blockを1個破壊したときは、DestructionManagerから
+WeaponServer.RecordPlayerBlockへ渡し、次の順序で処理する。
+
+1. 破壊直前のRAMPAGEを使って Config.Score.Block × 現在RAMPAGE をBlock Scoreへ加算する。
+2. そのblockについてプレイヤーのDestroyed blocksを1増やす。
+3. Config.Rampage.GainPerBlockだけRAMPAGEを増やし、MaxRampageを更新する。
+
+したがって、現在のRAMPAGEがx1.50なら、そのblockの基本Scoreが10点の場合は15点になり、
+次のblockからx1.51を使う。RAMPAGE倍率はBlock Scoreだけに適用し、BuildingBonus、NPC/Enemy/
+Kaiju撃破Score、FINAL Bonus、その他のScore categoryには適用しない。
+
+敵攻撃のPlayer被弾はWeaponServer.ApplyRampagePenaltyへ集約し、MinimumMultiplier未満へ
+下げない。被弾統計はHitsTakenとHitCountsBySourceへラウンド内だけ保持する。
+
+### TIMEと旧時間経済
+
+RoundClockは削除せず、通常BATTLEとFINALの残り時間のサーバー権威として使用する。
+ただし通常BATTLEのライブ経路から、敵被弾のTime Penalty、建物全壊のTime Bonus、Enemy撃破の
+Time Reward、Comeback Time Bonus、その他の既存時間経済を切っている。旧API、依存注入、
+Configの互換キーは既存呼び出し側との契約を壊さないため残しているが、現行の通常BATTLE進行へは
+影響しない。
+
+### 敵攻撃とKaiju攻撃
+
+Police、Soldier、Sniper、Tankの既存編成・増援・Retreat・移動・攻撃構造は維持し、
+Player被弾結果だけをRAMPAGE減少へ接続している。Tankの建物砲撃はattacker=nilで
+DestructionManagerへ入り、NPCDestroyedとTotalDestroyedへ加算される。
+MultiLockLauncher、Bazooka AutoFire、DevTestService、default.project.jsonのKaijuVFX保護設定も
+現行ローカル実装のまま保持している。
+
+Fireball Barrageは現行ローカル実装を正とし、Windup、3連発、TargetWarning、各shot開始時に
+固定するターゲット位置、Impact、attackId、generation、Cleanup、ChargeEmitter/
+ChargeLight、既存VFXを維持する。Playerに着弾したときだけ旧TIME減少を行わず、
+Config.Rampage.Penalties.KaijuFireball = 1.50 をApplyRampagePenaltyへ渡す。
+Fireballの建物爆発はattacker=nilである。
+
+TailSpinもPlayer被弾時はConfig.Rampage.Penalties.KaijuTailSpin = 1.00を使い、
+RoundClockを変更しない。建物爆発はattacker=nilである。Fireball、TailSpin、Tankの遅延処理は
+roundTokenまたはgenerationと現在のRuntime identityを検証し、旧ラウンドの副作用を拒否する。
+
+### HUD・RESULT・ラウンドリセット
+
+通常BATTLE HUDでは、既存のTIMEとScoreに加えてMAP DESTROYEDと本人のRAMPAGEをリアルタイム表示する。
+Police、Military、Tankの既存テロップと内部のThreat star表示は保持する。
+Block破壊時のMAP/RAMPAGE更新は小刻みに行い、被弾時はRAMPAGE -x.xxの短いfeedbackを表示する。
+モバイル/iPad向けの既存レイアウトと入力経路は維持する。
+
+RESULTでは以下を表示する。
+
+- MAP DESTROYED（TotalMapDestructionRate）
+- YOU（PlayerDestructionRate）
+- NPC（NPCDestructionRate）
+- SCORE
+- MAX RAMPAGE
+- END RAMPAGE
+- HITS TAKEN
+- DESTROYED BLOCKS
+- プレイヤーランキングのScore、Destroyed blocks、Destruction rate
+
+表示率は丸めるが、サーバー内部の率とblock数は正確な値を保持する。
+全Player破壊率とNPC破壊率は同じTotalBlocksを分母にするため、表示上の丸めを除けば
+PlayerDestroyed + NPCDestroyed = TotalDestroyed、またYOU + NPC = MAP DESTROYEDとなる。
+
+次ラウンド準備ではMAP統計、PlayerごとのScore/RAMPAGE/MaxRampage/HitsTaken/
+HitCountsBySource/Destroyed blocks、Threat stage、FINAL状態、RoundClock、Enemy/Kaiju Runtime、
+遅延攻撃・VFXをリセットする。UIControllerもResultGui、HUD値、RAMPAGE feedbackをクリアする。
+
+### 現行QA記録（2026-09-02）
+
+既存Place「破壊する」（placeId 109081398680442）で、DevTestの一時的な実行時注入を使い、
+本番コードとConfigへ恒久的なチートを追加せずに確認した。StudioはPlay終了後Editへ戻した。
+
+- 静的確認: Rojo build成功、ASCII junction経由のluau-lsp analyze終了コード0、
+  git diff --check終了コード0（既存の未使用警告と改行警告のみ）。
+- 現Configの到達実測: 5%でPolice、12%でMilitary、20%でTank、30%でFINAL。
+  5/12/20/30は現行Config値であり、5/15/30/50へ変更するバランス調整は行っていない。
+- Tank出現後の待機でNPC破壊数が増加し、Player RAMPAGEを増やさずTotal MAP率へ加算された。
+  TankShell被弾はTIMEを変更せず、TankShellのRAMPAGE減少とHitCountsBySourceへ記録された。
+- FINAL開始は一度だけで、ログ上のFINAL時計は約119.68秒および約119.71秒から開始した。
+  Config.FinalPhase.Duration = 120 の使用と、通常BATTLE時計を引き継がないことを確認した。
+  別実測のFINAL到達時刻はBATTLE開始から約237.68秒だった。
+- Fireball BarrageはKaiju Runtime上で3発のExplosion/Hit観測があり、既存の攻撃構造が動作した。
+  Fireball被弾のHitCountsBySourceはKaijuFireballへ入り、TIMEではなくRAMPAGEを減少させた。
+- RESULT実表示でMAP DESTROYED、YOU、NPC、SCORE、MAX/END RAMPAGE、HITS TAKEN、
+  DESTROYED BLOCKS、ランキングのDestroyed blocks/Destruction rateを確認した。
+  実測例はTotal 36% / YOU 4% / NPC 32% / Score 75,920 / Max x12.29 /
+  End x1.00 / Hits 61 / Player blocks 1,129である。
+- FINAL経由で「次へ」を押した次ラウンドは、サーバー統計がTotal/Player/NPC 0、
+  Score 0、RAMPAGE x1.00、Max x1.00、Hits 0、Destroyed blocks 0となり、
+  ResultGuiと旧RAMPAGE feedbackも消えた。Enemy、Kaiju、Projectilesも0だった。
+- 別実測ではScore 150,347、Max RAMPAGE x17.28、End RAMPAGE x17.28、
+  Total 44% / YOU 6% / NPC 38% / Player blocks 1,628 / Hits 0を記録した。
+- 通常BATTLEの別実測では、300秒満了時にFINAL閾値未到達のままRESULTへ進むTIME UP経路を確認した。
+- 現行の追加TailSpin QAではFireballからIdleへの復帰は観測できたが、TailSpinそのものの
+  新ゲームループ接続（実被弾、Config penalty、NPC破壊）を独立して確認できていない。
+  Kaiju-originのNPCDestroyedをFireball/TailSpin別に分離した実測も未確認である。
+- 既存Airstrikeの音声/Raycast警告と、QA用一時Scriptの入力ミスは今回の本番不具合として扱わない。
+
+### バランス調整の対象としてConfigだけで変更できる項目
+
+Config.Round.BattleTime、Config.FinalPhase.Duration、Config.Threat.Stagesの各Threshold、
+Config.Rampage.StartMultiplier、MinimumMultiplier、GainPerBlock、MaximumMultiplier、
+Config.Rampage.Penalties.*を変更すれば、今回のゲームループの主要バランスをコード変更なしで
+調整できる。現行QAではGainPerBlock、Penalty、Threat Threshold、BattleTimeを変更していない。
 
 ---
 
@@ -41,6 +203,7 @@ ServerScriptService
    ├─ RoundClock (ModuleScript)         バトル残り時間の管理(deadline方式・増減対応・損失キャップ)
    ├─ ThreatManager (ModuleScript)      段階(★)の政策。スコア監視・昇格・編成指示
    ├─ KaijuManager (ModuleScript)       ★4怪獣の生成・登場演出・ラウンド境界の破棄
+   ├─ DevTestService (ModuleScript)    Play中だけの開発用状態注入。Config.DevTestMode.Enabled=falseでは無効
    ├─ WeaponServer (ModuleScript)       武器3種のサーバー処理(Enabledフィルタ付き)・スコア集計
    ├─ VisualSetup (ModuleScript)        ライティングの初期設定(起動時1回。Terrainは生成しない)
    └─ TemplateValidator (ModuleScript)  手作りBuildingTemplatesの検証(従来モードのみで使用)
@@ -112,7 +275,7 @@ StarterPlayer/StarterPlayerScripts
 ### Config.Kaiju
 | キー | 値 | 備考 |
 |---|---|---|
-| Enabled | false | falseの場合は怪獣経路マーカーの検証・登場を無効化。本番自動起動はPhase 4-2でも無効 |
+| Enabled | true | ★4/FINAL到達時に怪獣を本番経路で起動 |
 | TemplateName | "KaijuTemplate" | `ServerStorage`内のModel名 |
 | SourceAssetId | 93372820152503 | Studio配置済みアセットの識別用 |
 | RootPartName | "HumanoidRootPart" | Clone後のPrimaryPart検証対象 |
@@ -125,9 +288,9 @@ StarterPlayer/StarterPlayerScripts
 | キー | 値 | 備考 |
 |---|---|---|
 | LobbyTime | 3 | |
-| BattleTime | 120 | 基礎値。`RoundClock`がこれを起点に増減する |
-| BattleTimeMax | 300 | ハードキャップ。`RoundClock.Add`で加算してもこれ以上は増えない |
-| BattleTimeFloor | 15 | 下限フロア。`RoundClock.Add`で減算してもこれ以下には下がらない |
+| BattleTime | 300 | 通常BATTLEの制限時間。RoundClockは自然なカウントダウンだけを行う |
+| BattleTimeMax | 9999 | 旧RoundClock.Add互換。通常BATTLEの固定時計では使用しない |
+| BattleTimeFloor | 15 | 旧RoundClock.Add互換。通常BATTLEの固定時計では使用しない |
 | ResultTime | 10 | **未使用**(2026-07-31〜)。RESULTが「次へ」ボタンによる手動進行になったため参照されなくなった。削除はせずコメント付きで残している |
 | ResultTimeout | 120 | 「次へ」が押されなかった場合に自動でLOBBYへ進むまでの秒数(安全弁) |
 
@@ -308,14 +471,14 @@ Airstrikeの`DestructionManager.Explode()`呼び出しは`respectOcclusion`を�
 | Block | 10 | |
 | NPC | 100 | |
 | BuildingBonus | 500 | |
-| BuildingBonusTime | 10 | 全壊時のタイム報酬(秒)。`RoundClock.Add`で共有タイムに加算。調整レバー優先順位1(THREAT_DESIGN_PROPOSAL.md §5-10) |
+| BuildingBonusTime | 10 | 旧全壊タイム報酬。API互換のため残すが、現行ゲームプレイでは参照しない |
 | BonusThreshold | 0.9 | |
 
 ### Config.Threat(★1〜)
 | キー | 値 | 備考 |
 |---|---|---|
 | Enabled | true | 固定MAPのEnemySpawns/RoadNodes/MapContext連携済み。falseで敵・Threat段階を無効化 |
-| ScoreSource | "sum" | "sum"=全プレイヤーのスコア合計 / "top"=最高スコア。`WeaponServer.GetTotalScore()`が参照 |
+| ScoreSource | "sum" | 旧API互換。Threat判定では参照せず、進行入力はTotal MAP破壊率 |
 | CheckInterval | 1 | 段階判定を行う間隔(秒) |
 | DebugLog | true | 段階到達時刻・湧き・撃破をサーバーログに出す |
 | CorpseDespawnTime | 6 | 撃破した敵の死体が消えるまでの秒数 |
@@ -329,7 +492,7 @@ Airstrikeの`DestructionManager.Explode()`呼び出しは`respectOcclusion`を�
 | Damage.BeamDuration | 0.2 | 赤い予告ビームが画面に残る秒数。判定とは無関係の見た目のみ |
 | Damage.RequireLineOfSight | true | 建物に遮られていれば命中しない |
 | Damage.RangeGrace | 1.1 | 着弾時の距離再判定でAttackRangeに掛ける猶予倍率 |
-| Damage.MaxLossPerMinute | 0 | 直近60秒あたりの最大損失キャップ。★1検証完了により0(無効)に戻し済み(2026-07-31)。★3で再検討 |
+| Damage.MaxLossPerMinute | 30 | 旧RoundClock.Add互換。現行の被弾はRAMPAGEへ移行済みで、通常BATTLEの時間は減らさない |
 | Damage.ComebackMultiplier | 1.5 | 残り時間僅少時の撃破報酬倍率 |
 | Damage.ComebackThreshold | 25 | 残りがこの秒数を下回るとComebackMultiplierが効く |
 | Spawn.MinDistanceFromPlayer | 100 | この距離以内には湧かせない |
@@ -339,10 +502,10 @@ Airstrikeの`DestructionManager.Explode()`呼び出しは`respectOcclusion`を�
 | Indicator.Enabled / MaxDistance / PoolSize / UpdateInterval / Margin | true / 400 / 8 / 0.1 / 40 | 画面端の方向インジケータ(クライアント側) |
 | EnemyTypes.PoliceOfficer / PoliceCar / Soldier / Tank | (§末尾参照) | ★1〜★3の敵種別は実装済み。★4怪獣はEnemyTypesへ登録せずEncounterで起動 |
 | HelicopterTransport.* | (§末尾参照) | Step5-1で新設。軍用ヘリの飛行・降下パラメータ。ヘリ自体はEnemyTypesに**登録しない**(戦闘する敵ではなく輸送演出専用) |
-| Stages[1] | ★1警察・Threshold=1000・Squad={PoliceCar×2, PoliceOfficer×2}・RespawnDelay=20 | 残りの警官はパトカーが道中で降車させる(§末尾参照)。全滅後RespawnDelay秒で新squadIdの再派遣(§17参照) |
-| Stages[2] | ★2軍隊・Threshold=4000(暫定値)・Squad={Soldier×4, transport="helicopter", arrivalSpawns={Sniper×2}}・ReinforcementInterval=20 | Step5-1/5-2で新設。生存数に関係なく20秒ごとに同じsquadIdへSquad一式を無制限追加(§17参照) |
-| Stages[3] | ★3戦車・Threshold=10000・Squad={Tank×2}・IndividualRespawnDelay=30 | Tankを1体ずつ同じsquadIdへ補充。建物砲撃を含む詳細は§21 |
-| Stages[4] | ★4怪獣・Threshold=20000・Encounter="Kaiju" | EnemyManagerの編成ではなくKaijuManagerの登場演出を起動。詳細は§23 |
+| Stages[1] | ★1警察・Threshold=0.05・Squad={PoliceCar×2, PoliceOfficer×2}・RespawnDelay=20 | Total MAP破壊率5%で昇格。残りの警官はパトカーが道中で降車させる |
+| Stages[2] | ★2軍隊・Threshold=0.12・Squad={Soldier×4, transport="helicopter", arrivalSpawns={Sniper×2}}・ReinforcementInterval=20 | Total MAP破壊率12%で昇格。生存数に関係なく20秒ごとに増援 |
+| Stages[3] | ★3戦車・Threshold=0.20・Squad={Tank×2}・IndividualRespawnDelay=30 | Total MAP破壊率20%で昇格。Tankを1体ずつ補充 |
+| Stages[4] | ★4怪獣・Threshold=0.30・Encounter="Kaiju" | Total MAP破壊率30%でFINAL開始。EnemyManager編成ではなくKaijuManagerを起動 |
 
 **Config.Threat.EnemyTypes.PoliceOfficer の内訳**
 
@@ -357,9 +520,9 @@ Airstrikeの`DestructionManager.Explode()`呼び出しは`respectOcclusion`を�
 | AttackRange | 100(Step3手順8で60から変更) |
 | AttackInterval | 2.2 |
 | Telegraph | 0(発砲と同時に着弾。★3の戦車等、重い攻撃には正の値を持たせる想定) |
-| TimePenalty | 1 |
+| TimePenalty | 1（旧互換値。現行のPlayer被弾はConfig.Rampage.Penalties.PoliceShotを使用） |
 | ScoreReward | 300 |
-| TimeReward | 0(Step3手順8で3から変更。理由は「Step3の設計判断」§9-2参照) |
+| TimeReward | 0（旧互換値。現行ゲームプレイではRoundClockへ加算しない） |
 
 **Config.Threat.EnemyTypes.PoliceCar の内訳(Step3で新設)**
 
@@ -375,8 +538,8 @@ Airstrikeの`DestructionManager.Explode()`呼び出しは`respectOcclusion`を�
 | MoveSpeed / ApproachSpeed | 26 | 攻撃しないため2段速度は使わず同値 |
 | StopDistance | 15 | 目的地(道路上の点)への到着判定距離。プレイヤーとの距離ではない |
 | AttackType | "none" | 攻撃しない |
-| TimePenalty | 0 | 接触ダメージ無し |
-| ScoreReward / TimeReward | 500 / 8 | 撃破時の報酬 |
+| TimePenalty | 0（攻撃なし。旧互換値） | 接触ダメージ無し |
+| ScoreReward / TimeReward | 500 / 8（TimeRewardは旧互換値） | 撃破時の報酬 |
 | SpawnY | 2.6 | 接地Y座標(車体半分の高さ。人型のSpawnY=3とは別体系) |
 | DeployOnArrive | true | 目的地到着で警官を降ろす |
 | DeployType | "PoliceOfficer" | 降ろす敵の種別 |
@@ -407,9 +570,9 @@ Airstrikeの`DestructionManager.Explode()`呼び出しは`respectOcclusion`を�
 | AttackType | "burst" | EnemyManagerはAttackTypeで分岐(敵タイプ名のベタ書き分岐はしない) |
 | AttackInterval | 3.0 | バースト"開始"から次のバースト"開始"までの間隔(警官のnextAttackと同じ意味)。5連射(約0.48秒)+ 休止(約2.5秒) |
 | BurstCount / BurstInterval | 5 / 0.12 | 5発が約0.48秒で終わる速度 |
-| TimePenalty | 0.5 | 1発命中ごとの秒数。5発命中で-2.5秒 |
+| TimePenalty | 0.5 | 旧互換値。現行は1発ごとにConfig.Rampage.Penalties.SoldierShotを使用 |
 | ScoreReward | 400(暫定値) | 最終スコア設計確定まで意味を持たせすぎない |
-| TimeReward | 0 | 「敵はタイムを配らない」という既存方針を維持 |
+| TimeReward | 0 | 旧互換値。現行ゲームプレイではRoundClockへ加算しない |
 | SpawnY | 3 | PoliceOfficerと同じ人型なので同じ接地Y座標 |
 
 **Config.Threat.HelicopterTransport の内訳(Step5-1で新設)**
@@ -1650,6 +1813,10 @@ BATTLE終了が投下途中に起きても、残りSoldierを遅延生成せず�
 - Soldier 4人の生成間隔は`1.00 / 1.00 / 1.03秒`、XZ間隔は`27.7 / 31.9 / 34.2 studs`
 - ★2の1人目投下直後に★3へ上げ、6秒後も旧Soldierは1人、旧ヘリ0、Tank 2台であることを確認
 - BATTLE終了相当の`SetAggressive(false)`でも、1人目投下後6秒間Soldierは1人のまま、ヘリ0
+> 注: 以下のPhase 4-1〜4-3Bは実装履歴を残した章である。現在のConfig値とゲームループは
+> 0-1の現行ランタイムスナップショットを正とする。特にKaiju有効化、Fireball Barrage、
+> RAMPAGE Penalty、MAP破壊率Threshold、FINAL時計の記述は0-1で上書きされる。
+
 ## Phase 4-1: 怪獣モデル読込・海からの出現・移動基盤
 
 Phase 4-1の現行追記。既存のPhase 3-3記録は旧経路の履歴として残す。

@@ -132,6 +132,10 @@ Config.Visual = {
 -- Kaijuの元データ識別子。実行時はServerStorage.KaijuTemplateをCloneする。
 Config.Kaiju = {
 	Enabled = true, -- Phase 4-3Bで★4到達時の本番経路へ接続する。
+	Scale = 4.0, -- Clone後、BoundingBox/Hitbox確定前に適用する怪獣全体倍率。
+	Marker = {
+		HeightOffset = 10,
+	},
 	Animations = {
 		Idle = "rbxassetid://125654140184351",
 		FireBreath = "rbxassetid://79039210156539",
@@ -139,15 +143,17 @@ Config.Kaiju = {
 	},
 	Combat = {
 		ThinkInterval = 0.25,
-		TailSpinRange = 30,
+		TailSpinRange = 30, -- TailSpinのTriggerRangeに相当する既存名。
 		AttackCooldown = 2,
+		AggroRange = 100, -- 次Phaseで移動中の認識範囲へ接続する予約設定。
 	},
 	Health = {
-		-- Phase 4-3A temporary values; balance is intentionally deferred.
-		MaxHP = 100,
+		-- Phase 4-3Aの独自HP管理。現在値はConfigから調整する。
+		MaxHP = 200,
 		Damage = {
 			Bazooka = 10,
 			Airstrike = 5,
+			MultiLockLauncher = 6,
 		},
 		Score = {
 			PerHP = 50,
@@ -161,23 +167,22 @@ Config.Kaiju = {
 	Hitbox = {
 		SizeScale = Vector3.new(0.7, 0.9, 0.7),
 	},
-	FireBreath = {
+	-- FireBreath animation is retained above as the windup animation asset.
+	-- The attack itself is now a fixed-position, telegraphed barrage.
+	FireballBarrage = {
 		Windup = 0.8,
-		ActiveDuration = 2.0,
+		WarningTime = 1.2,
+		ShotCount = 3,
+		ShotInterval = 0.45,
+		ExplosionRadius = 14,
+		PenaltySeconds = 5, -- 旧Fireball時間Penalty互換。現行値はRampage.Penalties.KaijuFireball
 		Recovery = 0.4,
-		Range = 100,
-		Width = 20,
-		Height = 24,
-		PlayerPenalty = 5,
-		BuildingBlastRadius = 10,
-		BuildingBlastSpacing = 20,
-		MaxBuildingExplosions = 8,
 	},
 	TailSpin = {
 		Windup = 0.8,
 		SpinDuration = 1.2,
 		Radius = 30,
-		PlayerPenalty = 8,
+		PlayerPenalty = 8, -- 旧TailSpin時間Penalty互換。現行値はRampage.Penalties.KaijuTailSpin
 		BuildingBlastRadius = 24,
 	},
 	SpawnMarkerName = 'Boss03', -- 海側の既存BossSpawns。未指定時は名前順の先頭を使う。
@@ -188,7 +193,7 @@ Config.Kaiju = {
 		SubmergeRatio = 1.1, -- BoundingBox高さに対する開始深度倍率。モデル変更時もほぼ全身を海中に保つ。
 	},
 	Movement = {
-		Speed = 6,
+		Speed = 10,
 		StopDistance = 8,
 	},
 	TemplateName = "KaijuTemplate",
@@ -206,11 +211,15 @@ Config.Kaiju = {
 	RuntimeFolderName = "KaijuRuntime",
 }
 
+Config.DevTestMode = {
+	Enabled = false,
+}
+
 Config.Round = {
 	LobbyTime = 3, -- ロビー待機(この間にマップ生成)
-	BattleTime = 300, -- 破壊タイム(基礎値。RoundClockがこれを起点に増減する)
-	BattleTimeMax = 9999, -- ハードキャップ(RoundClock.Addで加算してもこれ以上は増えない)
-	BattleTimeFloor = 15, -- 下限フロア(RoundClock.Addで減算してもこれ以下には下がらない)
+	BattleTime = 300, -- 通常BATTLEの制限時間(秒)。RoundClockは自然なカウントダウンだけを行う
+	BattleTimeMax = 9999, -- 旧RoundClock.Add互換。通常BATTLEの固定時計はこの値を使わない
+	BattleTimeFloor = 15, -- 旧RoundClock.Add互換。通常BATTLEの固定時計はこの値を使わない
 	-- ※未使用(2026-07-31〜)。リザルトが「次へ」ボタンによる手動進行になったため、
 	-- この秒数を使うカウントダウンは無くなった。他から参照されていないことを確認済みだが、
 	-- 削除はせずコメントで明記して残す
@@ -322,8 +331,8 @@ Config.Weapons = {
 		Enabled = true,
 		DisplayName = "バズーカ",
 		SlotKey = 1, -- キーボードの数字キー
-		Radius = 25, -- 爆発半径(stud)
-		Cooldown = 0.3, -- 連射間隔(秒)。AutoFireがtrueの間、この間隔で撃ち続けられる
+		Radius = 15, -- 爆発半径(stud)
+		Cooldown = 0.5, -- 連射間隔(秒)。AutoFireがtrueの間、この間隔で撃ち続けられる
 		AutoFire = true, -- 押しっぱなしで連射するか。Airstrike/RemoteBombには付けない(単発のまま)
 		Speed = 100, -- 弾速(stud/s) ゆっくりめで弾が見える
 		MaxDistance = 140, -- 最大飛距離。旧400。プレイヤーが移動する理由を作るため短縮(Step4d)
@@ -335,19 +344,19 @@ Config.Weapons = {
 		Enabled = true,
 		DisplayName = "エアストライク",
 		SlotKey = 2,
-		Radius = 25, -- 爆弾1発の爆発半径
+		Radius = 15, -- 爆弾1発の爆発半径
 		Cooldown = 20, -- 1ラウンド120秒なので約6回使える
 		Delay = 3, -- マーカー表示から第1弾の投下までの秒数
-		DropHeight = 80, -- 爆弾の落下開始高度(戦闘機の飛行高度でもある)
+		DropHeight = 60, -- 爆弾の落下開始高度(戦闘機の飛行高度でもある)
 		SurfaceProbeMargin = 5, -- MAP最高点より上から地表面を探す余白(stud)
 		SurfaceOffset = 0.15, -- 爆心を着弾面の外側へ出す微小な余白(stud)
 		FallTime = 1.1, -- 落下にかかる秒数
-		PlaneCount = 3, -- 編隊の機数
-		BombsPerPlane = 6, -- 1機あたりの投下数(合計 PlaneCount * BombsPerPlane = 18発)
+		PlaneCount = 2, -- 編隊の機数
+		BombsPerPlane = 24, -- 1機あたりの投下数(合計 PlaneCount * BombsPerPlane = 18発)
 		-- 爆発の時間差(秒)。戦闘機の速度はこの値から導出されるため、
 		-- 機影が遅すぎる/速すぎると感じたらここを動かす(PlaneSpeedという入力値は持たない)
 		BombInterval = 0.08,
-		LineLength = 120, -- 爆撃線の長さ
+		LineLength = 300, -- 爆撃線の長さ
 		LineWidth = 20, -- 編隊の横幅(機の間隔 × 2)
 		Sequential = true, -- true=1発ずつ順に掃射 / false=PlaneCount機が横並びで同時
 		-- 1発あたりの物理化上限。既定(Config.Debris.MaxRealPerExplosion=30)と同値=絞らない。
@@ -356,11 +365,30 @@ Config.Weapons = {
 		PlaneLead = 60, -- 線の始点手前/終点先へ延長する助走・余韻の距離
 		PlaneParts = 5, -- 1機あたりのパーツ数(パーツ予算の見積り用。コードは参照しない)
 	},
+	MultiLockLauncher = {
+		Enabled = true,
+		DisplayName = "マルチロックランチャー",
+		SlotKey = 3,
+		MaxLocks = 40,
+		LockInterval = 0.12,
+		LockRange = 300,
+		LockScreenRadius = 180,
+		NPCMaxLocks = 1,
+		TankMaxLocks = 2,
+		BossMaxLocks = 4,
+		BuildingLockMinSpacing = 6,
+		MissileLaunchInterval = 0.04,
+		ExplosionRadius = 10,
+		MissileSpeed = 150,
+		TurnSpeed = 720,
+		Cooldown = 10,
+		MaxFlightTime = 5,
+	},
 	RemoteBomb = {
 		-- 削除ではなく一時無効化。復活時はtrueへ戻すだけでよい。
 		Enabled = false,
 		DisplayName = "リモート爆弾",
-		SlotKey = 3,
+		SlotKey = 4,
 		Radius = 30, -- 起爆時の爆発半径(大爆発)
 		Cooldown = 1, -- 起爆後のクールダウン
 		MaxBombs = 10, -- 同時設置数の上限
@@ -378,7 +406,7 @@ Config.Weapons = {
 		},
 	},
 }
-Config.WeaponOrder = { "Bazooka", "Airstrike", "RemoteBomb" }
+Config.WeaponOrder = { "Bazooka", "Airstrike", "MultiLockLauncher", "RemoteBomb" }
 
 -- 武器の有効/無効は全利用側でこの判定を共有する。
 -- Enabled=nil は後方互換のため有効として扱い、false のときだけ無効にする。
@@ -448,18 +476,36 @@ Config.Score = {
 	Block = 10, -- ブロック1個破壊
 	NPC = 100, -- NPC1体撃破
 	BuildingBonus = 500, -- 全壊ボーナス(棟ごとに1回)
-	-- 全壊時のタイム報酬(秒)。共有タイム(RoundClock)に加算する。
-	-- ★調整レバー: 実機で「敵を無視して建物だけ壊す」が最適解になった場合、最初に下げるのはここ
-	-- (10→5。THREAT_DESIGN_PROPOSAL.md §5-10 優先順位1)
+	-- 旧全壊タイム報酬。API互換のため残すが、現行ゲームプレイでは参照しない。
 	BuildingBonusTime = 10,
 	BonusThreshold = 0.9, -- 全壊とみなす破壊率(90%)
 	BonusMinShare = 0.5, -- 敵が全壊ラインを越えた場合に首位貢献者へボーナスを残す最低貢献率
 }
 
+-- ▼ RAMPAGE ----------------------------------------------------------
+-- プレイヤーごとにラウンド内で保持する建物破壊倍率。nilのMaximumMultiplierは青天井。
+Config.Rampage = {
+	Enabled = true,
+	StartMultiplier = 1.00,
+	MinimumMultiplier = 1.00,
+	GainPerBlock = 0.01,
+	MaximumMultiplier = nil,
+	Penalties = {
+		PoliceShot = 0.25,
+		SoldierShot = 0.05,
+		SniperShot = 0.50,
+		TankShell = 1.00,
+		KaijuFireball = 1.50,
+		-- TailSpinの新暫定値は指定がないため、既存攻撃をTIME経済に残さない最小限の仮値。
+		KaijuTailSpin = 1.00,
+	},
+}
+
 -- ▼ 敵システム(★1〜) --------------------------------------------------
 Config.Threat = {
 	Enabled = true, -- 固定MAP MetadataをMapContext経由で利用する本番経路
-	ScoreSource = "sum", -- "sum"=全プレイヤーのスコア合計 / "top"=最高スコア
+	ProgressSource = "totalMapDestructionRate", -- Total MAP破壊率をThreat進行の入力にする
+	ScoreSource = "sum", -- 旧API互換用。Threat判定では参照しない
 	CheckInterval = 1, -- 段階判定を行う間隔(秒)
 	DebugLog = true, -- 段階到達時刻・湧き・撃破をサーバーログに出す(閾値チューニング用)
 
@@ -493,10 +539,10 @@ Config.Threat = {
 
 		-- 直近60秒あたりの最大損失キャップ。0=無効。
 		-- ★3戦車の砲撃を追加したため、無敵時間は0のまま1分あたり30秒に制限する
-		MaxLossPerMinute = 30,
+		MaxLossPerMinute = 30, -- 旧RoundClock.Add互換。現行の被弾はRAMPAGEへ移行済み
 
-		ComebackMultiplier = 1.5, -- 残り時間が少ないときの撃破報酬の倍率
-		ComebackThreshold = 25, -- 残りがこの秒数を下回ると ComebackMultiplier が効く
+		ComebackMultiplier = 1.5, -- 旧Enemy Kill TimeReward互換。現行ゲームプレイでは未使用
+		ComebackThreshold = 25, -- 旧Enemy Kill TimeReward互換。現行ゲームプレイでは未使用
 	},
 
 	-- ▼ 湧き
@@ -717,9 +763,8 @@ Config.Threat = {
 	Stages = {
 		{
 			Name = "★1 警察",
-			-- 仮値。開始30秒時点のスコアを実測して設定する。
-			-- Step 4(連鎖ボーナス・絨毯爆撃)でスコアの伸び方が変わるため、そこで再測定が必要。
-			Threshold = 1000,
+			-- Total MAP破壊率(0〜1)の閾値。値はここだけで調整する。
+			Threshold = 0.05,
 			Telop = "警察が出動した!",
 			Sound = "Siren",
 			RespawnDelay = 20, -- 編成が全滅してから次の部隊が来るまでの秒数
@@ -730,8 +775,7 @@ Config.Threat = {
 		},
 		{
 			Name = "★2 軍隊",
-			-- 暫定値。最終クリア条件・★3以降・スコア進行設計確定後に再調整
-			Threshold = 4000,
+			Threshold = 0.12,
 			Telop = "軍が出動した!",
 			Sound = "Siren",
 			-- 全滅を待たない定期増援(旧RespawnDelayから移行)。生存数に関係なく、この秒数ごとに
@@ -756,7 +800,7 @@ Config.Threat = {
 		},
 		{
 			Name = "★3 戦車",
-			Threshold = 10000,
+			Threshold = 0.20,
 			Telop = "戦車部隊が出動した!",
 			Sound = "Siren",
 			IndividualRespawnDelay = 30, -- Tankを1台撃破するたび、そのTankだけ30秒後に補充する
@@ -766,7 +810,7 @@ Config.Threat = {
 		},
 		{
 			Name = "★4 怪獣",
-			Threshold = 20000,
+			Threshold = 0.30,
 			Telop = "怪獣が海から現れた！",
 			Sound = "Siren",
 			FinalPhase = true,
@@ -805,6 +849,7 @@ Config.RemoteNames = {
 	"Cooldown", -- クールダウン開始通知(本人のみ)
 	"BombCount", -- リモート爆弾の設置数(本人のみ)
 	"Hud", -- HUD演出指示(タイム増減・被弾・段階昇格など。Step0時点では未使用。配線のみ先行)
+	"DevTest", -- Studio限定DevTest操作(許可された操作だけをサーバーで処理)
 	-- クライアント → サーバー
 	"Fire", -- 発射リクエスト
 	"Action", -- その他アクション(起爆など)

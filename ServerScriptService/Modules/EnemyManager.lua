@@ -22,10 +22,36 @@ local Config = require(ReplicatedStorage:WaitForChild("Config"))
 
 local EnemyManager = {}
 local rng = Random.new()
+local DEVTEST_SQUAD_ID = "__DEVTEST__"
+
+local function cloneValue(value)
+	if typeof(value) ~= "table" then
+		return value
+	end
+	local copy = {}
+	for key, child in value do
+		copy[key] = cloneValue(child)
+	end
+	return copy
+end
+
+local function isFiniteNumber(value)
+	return typeof(value) == "number"
+		and value == value
+		and value ~= math.huge
+		and value ~= -math.huge
+end
+
+local function isFiniteVector3(value)
+	return typeof(value) == "Vector3"
+		and isFiniteNumber(value.X)
+		and isFiniteNumber(value.Y)
+		and isFiniteNumber(value.Z)
+end
 
 -- Init()で注入される依存:
--- { addScore(player,points,category), addTime(delta,reason,player)->applied, getRemaining()->number,
---   effectRemote, hudRemote, explode(ctx) }
+-- { addScore(player,points,category), applyRampagePenalty(player,amount,attackType),
+--   addTime(旧API), getRemaining(旧API), effectRemote, hudRemote, explode(ctx) }
 -- MAP依存情報はラウンドごとにSetMapContext()で別途設定する。
 local deps = nil
 
@@ -80,6 +106,12 @@ local SNIPER_FALL_TIMEOUT = sniperConfig.FallTimeout or 4
 local SNIPER_FALL_DISTANCE = sniperConfig.FallDistance or 200
 
 local THINK_INTERVAL = 0.2 -- 標的の再選択・攻撃判定を行う頻度(移動自体は毎フレーム)
+
+local function getRampagePenalty(attackType)
+	local rampage = Config.Rampage
+	local penalties = if typeof(rampage) == "table" then rampage.Penalties else nil
+	return math.max(tonumber(penalties and penalties[attackType]) or 0, 0)
+end
 
 local function releaseSniperSpawn(enemy)
 	local spawnName = enemy.sniperSpawnName
@@ -609,7 +641,8 @@ end
 -- 個体生成の単一入口。警官の生成経路はここだけにする(Step3のパトカー降車、Step5-1のヘリ降下もこれを通す)。
 -- squadIdの付け忘れが構造的に起きないようにするため。
 -- options(任意): { deploying=true, deployFromY=number, suppressSpawnEffect=true,
---   alignToGround=true }。alignToGroundは固定MAPのspawn markerを地面の表面として扱う。
+--   alignToGround=true, Scale=number, testConfig=table }。alignToGroundは固定MAPの
+-- spawn markerを地面の表面として扱う。testConfigはSpawnForTestが作ったコピーだけを受け取る。
 -- 省略時(第4引数なし)は既存呼び出しと完全に同じ挙動を維持する
 local function spawnEnemy(typeName, position, squadId, options)
 	if systemDisabled or finalPhase then
@@ -620,7 +653,9 @@ local function spawnEnemy(typeName, position, squadId, options)
 	if retiredSquads[squadId] then
 		return nil
 	end
-	local etype = Config.Threat.EnemyTypes[typeName]
+	local etype = if options and typeof(options.testConfig) == "table"
+		then options.testConfig
+		else Config.Threat.EnemyTypes[typeName]
 	if not etype then
 		warn(("[EnemyManager] 未知の敵タイプ '%s' が指定されました。無視します"):format(typeName))
 		return nil
@@ -670,7 +705,6 @@ local function spawnEnemy(typeName, position, squadId, options)
 		end
 		model.PrimaryPart = core
 		model:PivotTo(rootCf)
-		prepareRigForCustomMovement(model, core)
 	elseif etype.Body == "model" then
 		local template = getModelTemplate(etype.ModelTemplate)
 		if not template then
@@ -690,7 +724,26 @@ local function spawnEnemy(typeName, position, squadId, options)
 		model.Name = etype.DisplayName
 		core, markerAnchor = buildHumanBody(model, rootCf, etype)
 	end
+
 	model.PrimaryPart = core
+	local requestedScale = if options and isFiniteNumber(options.Scale) then options.Scale else 1
+	if requestedScale <= 0 then
+		requestedScale = 1
+	end
+	if requestedScale ~= 1 then
+		local ok, err = pcall(function()
+			model:ScaleTo(requestedScale)
+		end)
+		if not ok then
+			warn(("[EnemyManager] %s のScale適用に失敗しました: %s")
+				:format(typeName, tostring(err)))
+		end
+	end
+	if etype.Body == "rig" then
+		-- ScaleTo後に質量を確定してから重力相殺を作る。先に作ると大きさ変更後に
+		-- VectorForceが旧質量のままになり、移動開始時の高さが不安定になる。
+		prepareRigForCustomMovement(model, core)
+	end
 	local groundY = position.Y
 	if alignToGround then
 		local configuredGroundY = options and options.groundSurfaceY
@@ -806,7 +859,7 @@ local function spawnEnemy(typeName, position, squadId, options)
 	enemies[model] = enemy
 
 	if Config.Threat.DebugLog then
-		print(("[EnemyManager] %s が湧きました (squad=%d)"):format(etype.DisplayName, squadId))
+		print(("[EnemyManager] %s が湧きました (squad=%s)"):format(etype.DisplayName, squadId))
 	end
 	-- ヘリ降下中は着地演出(updateDeployingEnemy)側で1回だけ出す。ここで出すと
 	-- 空中降下中なのに地上で湧き煙が先に出てしまうため(Step5-1)
@@ -854,7 +907,7 @@ local function isBlocked(fromPos, toPos)
 	return raycastMap(fromPos, toPos) ~= nil
 end
 
-local function damagePlayer(player, penalty, hitPos)
+local function damagePlayer(player, penalty, hitPos, attackType)
 	local state = playerState[player]
 	if not state then
 		state = { invincibleUntil = 0 }
@@ -868,10 +921,14 @@ local function damagePlayer(player, penalty, hitPos)
 	end
 	state.invincibleUntil = now + Config.Threat.Damage.Invincible
 
-	-- appliedの値(損失キャップで0になったか)は見ない。0でも赤フラッシュは出す。
-	-- それだけで「守られた」がプレイヤーに伝わる(Hud "notice"は送らない)
-	deps.addTime(-penalty, "hit", player)
-	deps.hudRemote:FireClient(player, "hit", {}) -- 撃たれた本人だけに赤フラッシュ
+	local applied = if deps.applyRampagePenalty
+		then deps.applyRampagePenalty(player, penalty, attackType)
+		else 0
+	-- 実際の減少量を送る。RAMPAGEが最低値に張り付いた場合も赤フラッシュは出す。
+	deps.hudRemote:FireClient(player, "hit", {
+		attackType = attackType,
+		rampageDelta = applied,
+	}) -- 撃たれた本人だけに赤フラッシュ
 	deps.effectRemote:FireAllClients("enemyShotHit", { position = hitPos })
 end
 
@@ -905,7 +962,7 @@ local function resolveAttack(enemy, targetPlayer, toPos, token)
 		return
 	end
 
-	damagePlayer(targetPlayer, etype.TimePenalty, root.Position)
+	damagePlayer(targetPlayer, getRampagePenalty("PoliceShot"), root.Position, "PoliceShot")
 end
 
 -- 攻撃シーケンス: 判定タイミング(0秒=発砲と同時、または敵種別のTelegraph秒後)と、
@@ -972,7 +1029,7 @@ local function resolveBurstShot(enemy, targetPlayer)
 	return true, root.Position
 end
 
--- バースト全体の制御。5発をBurstInterval間隔で撃ち、命中数をまとめて1回だけタイムに反映する(§22)。
+-- バースト全体の制御。5発をBurstInterval間隔で撃ち、命中した弾ごとにRAMPAGEを減らす。
 -- enemy.burstingで多重起動を防ぐ(同じ敵が同時に複数バーストを開始しない。§17)
 local function fireBurst(enemy, targetPlayer)
 	if enemy.bursting then
@@ -983,8 +1040,7 @@ local function fireBurst(enemy, targetPlayer)
 	local token = roundToken
 
 	task.spawn(function()
-		local hitCount = 0
-		local lastHitPos = nil
+		local hitPositions = {}
 
 		for shot = 1, etype.BurstCount do
 			-- 各弾の発射直前に中断条件を確認する(§23): ラウンド終了・撤退中(非aggressive)・
@@ -994,8 +1050,7 @@ local function fireBurst(enemy, targetPlayer)
 			end
 			local hit, hitPos = resolveBurstShot(enemy, targetPlayer)
 			if hit then
-				hitCount += 1
-				lastHitPos = hitPos
+				table.insert(hitPositions, hitPos)
 			end
 			if shot < etype.BurstCount then
 				task.wait(etype.BurstInterval)
@@ -1004,7 +1059,7 @@ local function fireBurst(enemy, targetPlayer)
 
 		enemy.bursting = false
 
-		if roundToken ~= token or hitCount <= 0 then
+		if roundToken ~= token or #hitPositions <= 0 then
 			return
 		end
 		-- Retreating中に撃破・撤退が挟まった場合は蓄積ダメージを丸ごと破棄する(§23)。
@@ -1012,7 +1067,9 @@ local function fireBurst(enemy, targetPlayer)
 		if enemy.model and enemy.model:GetAttribute("Retreating") then
 			return
 		end
-		damagePlayer(targetPlayer, hitCount * etype.TimePenalty, lastHitPos)
+		for _, hitPos in hitPositions do
+			damagePlayer(targetPlayer, getRampagePenalty("SoldierShot"), hitPos, "SoldierShot")
+		end
 	end)
 end
 
@@ -1049,7 +1106,7 @@ local function resolveSniperShot(enemy, targetPlayer, origin, direction, token)
 	local result = workspace:Raycast(origin, direction * etype.AttackRange, params)
 
 	if result then
-		damagePlayer(targetPlayer, etype.TimePenalty, result.Position)
+		damagePlayer(targetPlayer, getRampagePenalty("SniperShot"), result.Position, "SniperShot")
 	else
 		deps.effectRemote:FireAllClients("enemyShotMiss", { position = origin + direction * etype.AttackRange })
 	end
@@ -1099,7 +1156,7 @@ local function resolveTankShell(enemy, targetPlayer, impactPosition, token)
 	local current = root.Position
 	local horizontal = Vector3.new(current.X - impactPosition.X, 0, current.Z - impactPosition.Z).Magnitude
 	if horizontal <= enemy.etype.ShellRadius then
-		damagePlayer(targetPlayer, enemy.etype.TimePenalty, impactPosition)
+		damagePlayer(targetPlayer, getRampagePenalty("TankShell"), impactPosition, "TankShell")
 	end
 	-- 命中・回避に関係なく固定着弾点で爆発演出を出す。建物破壊APIは呼ばない。
 	deps.effectRemote:FireAllClients("explosion", {
@@ -1980,18 +2037,11 @@ local function killEnemy(enemy, ctx)
 		end
 	end
 
-	-- ctx.attacker==nil(将来の戦車のフレンドリーファイア用)ではスコアもタイムも与えない。
+	-- ctx.attacker==nil(将来の戦車のフレンドリーファイア用)ではスコアを与えない。
 	-- 自滅で稼げてはならない
 	if ctx.attacker then
 		deps.addScore(ctx.attacker, enemy.etype.ScoreReward, "enemy")
 		killCounts[ctx.attacker] = (killCounts[ctx.attacker] or 0) + 1 -- リザルトの撃破数集計用
-
-		local reward = enemy.etype.TimeReward
-		local dmgCfg = Config.Threat.Damage
-		if deps.getRemaining() < dmgCfg.ComebackThreshold then
-			reward = reward * dmgCfg.ComebackMultiplier
-		end
-		deps.addTime(reward, "enemyKill", ctx.attacker)
 	end
 
 	deps.effectRemote:FireAllClients("enemyKill", { position = enemy.core.Position })
@@ -2208,6 +2258,59 @@ function EnemyManager.SetMapContext(context)
 			:format(#spawnPoints, #sniperSpawnPoints, roadNodeCount, mapCenter.X, mapCenter.Z,
 				mapBounds.minX, mapBounds.maxX, mapBounds.minZ, mapBounds.maxZ))
 	end
+end
+
+-- DevTest専用の薄い入口。個体生成そのものは通常ラウンドと同じspawnEnemy()へ
+-- 委譲し、Config.Threat.EnemyTypesの共有テーブルへoverrideを書き込まない。
+function EnemyManager.SpawnForTest(typeName, position, options)
+	if not (RunService:IsStudio()
+		and typeof(Config.DevTestMode) == "table"
+		and Config.DevTestMode.Enabled == true) then
+		return nil
+	end
+	if typeof(typeName) ~= "string" or not isFiniteVector3(position) then
+		return nil
+	end
+
+	local baseConfig = Config.Threat.EnemyTypes[typeName]
+	if typeof(baseConfig) ~= "table" then
+		return nil
+	end
+
+	local testConfig = cloneValue(baseConfig)
+	local testOptions = {
+		alignToGround = true,
+		testConfig = testConfig,
+	}
+	options = if typeof(options) == "table" then options else {}
+
+	local scale = options.Scale
+	if scale ~= nil then
+		if not isFiniteNumber(scale) or scale < 0.25 or scale > 4 then
+			return nil
+		end
+		testOptions.Scale = scale
+	end
+
+	local overrides = options.Overrides
+	if overrides ~= nil and typeof(overrides) ~= "table" then
+		return nil
+	end
+	if typeof(overrides) == "table" then
+		for key, value in overrides do
+			if key ~= "AttackInterval" then
+				return nil
+			end
+			if not isFiniteNumber(value) or value < 0 or value > 100 then
+				return nil
+			end
+			if key == "AttackInterval" then
+				testConfig.AttackInterval = value
+			end
+		end
+	end
+
+	return spawnEnemy(typeName, position, DEVTEST_SQUAD_ID, testOptions)
 end
 
 --------------------------------------------------------------------

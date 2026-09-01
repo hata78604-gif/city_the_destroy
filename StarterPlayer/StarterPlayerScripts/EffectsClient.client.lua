@@ -26,6 +26,8 @@ local fxFolder = Instance.new("Folder")
 fxFolder.Name = "ClientFX"
 fxFolder.Parent = workspace
 local activeEnemyAimBeams = {}
+local activeKaijuWarnings = {}
+local latestKaijuGeneration = 0
 
 --------------------------------------------------------------------
 -- サウンド(3D位置つき再生。無効なIDでも止まらない)
@@ -140,6 +142,7 @@ local SPARK_TEX = "rbxasset://textures/particles/sparkles_main.dds"
 -- 爆発: 火花 + 煙 + 閃光 + 音 + カメラシェイク
 local function onExplosion(data)
 	local pos, radius = data.position, data.radius
+	local isMultiLock = data.source == "MultiLockLauncher"
 	local holder = makeHolder(pos, 4)
 
 	-- 炎
@@ -149,7 +152,7 @@ local function onExplosion(data)
 			NumberSequenceKeypoint.new(0, radius * 0.25),
 			NumberSequenceKeypoint.new(1, radius * 0.7),
 		}),
-		NumberRange.new(0.3, 0.7), NumberRange.new(radius * 1.5, radius * 3)):Emit(40)
+		NumberRange.new(0.3, 0.7), NumberRange.new(radius * 1.5, radius * 3)):Emit(if isMultiLock then 16 else 40)
 	-- 煙
 	makeEmitter(holder, SMOKE_TEX,
 		ColorSequence.new(Color3.fromRGB(110, 105, 100)),
@@ -157,17 +160,17 @@ local function onExplosion(data)
 			NumberSequenceKeypoint.new(0, radius * 0.35),
 			NumberSequenceKeypoint.new(1, radius * 1.0),
 		}),
-		NumberRange.new(1, 2.2), NumberRange.new(radius * 0.8, radius * 1.5)):Emit(25)
+		NumberRange.new(1, 2.2), NumberRange.new(radius * 0.8, radius * 1.5)):Emit(if isMultiLock then 10 else 25)
 	-- 火花
 	makeEmitter(holder, SPARK_TEX,
 		ColorSequence.new(Color3.fromRGB(255, 240, 150)),
 		NumberSequence.new(0.8),
-		NumberRange.new(0.4, 0.9), NumberRange.new(radius * 3, radius * 5)):Emit(20)
+		NumberRange.new(0.4, 0.9), NumberRange.new(radius * 3, radius * 5)):Emit(if isMultiLock then 8 else 20)
 
 	-- 閃光(短時間のPointLight)
 	local light = Instance.new("PointLight")
 	light.Brightness = 8
-	light.Range = radius * 3
+	light.Range = radius * (if isMultiLock then 2 else 3)
 	light.Color = Color3.fromRGB(255, 190, 110)
 	light.Parent = holder
 	TweenService:Create(light, TweenInfo.new(0.3), { Brightness = 0 }):Play()
@@ -179,7 +182,7 @@ local function onExplosion(data)
 
 	-- カメラシェイク(距離減衰)
 	local dist = (camera.CFrame.Position - pos).Magnitude
-	addShake((radius / 12) * 0.6 * math.clamp(1 - dist / 130, 0, 1))
+	addShake((radius / 12) * (if isMultiLock then 0.35 else 0.6) * math.clamp(1 - dist / 130, 0, 1))
 end
 
 -- 絨毯爆撃の予告マーカー(赤い矩形、点滅)。
@@ -207,6 +210,100 @@ local function onMarker(data)
 	task.delay(data.duration + 2, function()
 		marker:Destroy()
 	end)
+end
+
+local function destroyKaijuWarning(key)
+	local entry = activeKaijuWarnings[key]
+	if not entry then
+		return
+	end
+	activeKaijuWarnings[key] = nil
+	if entry.tween then
+		entry.tween:Cancel()
+	end
+	if entry.marker and entry.marker.Parent then
+		entry.marker:Destroy()
+	end
+end
+
+local function onTargetWarning(data)
+	if typeof(data) ~= "table"
+		or typeof(data.position) ~= "Vector3"
+		or typeof(data.radius) ~= "number"
+		or typeof(data.duration) ~= "number" then
+		return
+	end
+
+	local generation = tonumber(data.generation) or 0
+	if generation < latestKaijuGeneration then
+		return
+	end
+	if generation > latestKaijuGeneration then
+		for key in pairs(activeKaijuWarnings) do
+			destroyKaijuWarning(key)
+		end
+		latestKaijuGeneration = generation
+	end
+
+	local radius = math.max(data.radius, 0)
+	local duration = math.max(data.duration, 0)
+	if radius <= 0 or duration <= 0 then
+		return
+	end
+	local attackId = tostring(data.attackId or generation)
+	local key = attackId .. ":" .. tostring(data.shotIndex or 0)
+	destroyKaijuWarning(key)
+
+	local marker = Instance.new("Part")
+	marker.Name = "KaijuTargetWarning"
+	marker.Shape = Enum.PartType.Cylinder
+	marker.Size = Vector3.new(0.22, radius * 2, radius * 2)
+	marker.CFrame = CFrame.new(data.position + Vector3.new(0, 0.08, 0))
+		* CFrame.Angles(0, 0, math.rad(90))
+	marker.Color = Color3.fromRGB(255, 40, 40)
+	marker.Material = Enum.Material.Neon
+	marker.Transparency = 0.5
+	marker.Anchored = true
+	marker.CanCollide = false
+	marker.CanTouch = false
+	marker.CanQuery = false
+	marker.CastShadow = false
+	marker.Parent = fxFolder
+
+	local tween = TweenService:Create(
+		marker,
+		TweenInfo.new(math.max(math.min(duration * 0.25, 0.25), 0.05), Enum.EasingStyle.Sine, Enum.EasingDirection.InOut, -1, true),
+		{ Transparency = 0.25 })
+	tween:Play()
+	local entry = {
+		marker = marker,
+		tween = tween,
+		attackId = attackId,
+		generation = generation,
+	}
+	activeKaijuWarnings[key] = entry
+	task.delay(duration, function()
+		if activeKaijuWarnings[key] == entry then
+			destroyKaijuWarning(key)
+		end
+	end)
+end
+
+local function onTargetWarningCancel(data)
+	if typeof(data) ~= "table" then
+		return
+	end
+	local generation = tonumber(data.generation)
+	if generation and generation > latestKaijuGeneration then
+		latestKaijuGeneration = generation
+	end
+	local attackId = data.attackId and tostring(data.attackId) or nil
+	for key, entry in pairs(activeKaijuWarnings) do
+		if (not attackId or entry.attackId == attackId)
+			and (not generation or entry.generation <= generation) then
+			destroyKaijuWarning(key)
+		end
+	end
 end
 
 -- 絨毯爆撃の飛行音。投下開始時に1回だけ届く(機数ぶんは鳴らさない)
@@ -381,7 +478,11 @@ end
 -- ディスパッチ
 --------------------------------------------------------------------
 effectRemote.OnClientEvent:Connect(function(effectType, data)
-	if effectType == "explosion" then
+	if effectType == "TargetWarning" then
+		onTargetWarning(data)
+	elseif effectType == "TargetWarningCancel" then
+		onTargetWarningCancel(data)
+	elseif effectType == "Impact" or effectType == "explosion" then
 		onExplosion(data)
 	elseif effectType == "marker" then
 		onMarker(data)
@@ -393,6 +494,8 @@ effectRemote.OnClientEvent:Connect(function(effectType, data)
 		onNpcKill(data)
 	elseif effectType == "shot" then
 		playSound(Config.Sounds.Shot, data.position, 0.7, 1)
+	elseif effectType == "multiLockShot" then
+		playSound(Config.Sounds.Shot, data.position, 0.45, 1.15, 0.03)
 	elseif effectType == "whistle" then
 		playSound(Config.Sounds.Whistle, data.position, 0.6, 1)
 	elseif effectType == "beep" then

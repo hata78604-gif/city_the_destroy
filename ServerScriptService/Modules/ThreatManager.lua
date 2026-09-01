@@ -3,7 +3,7 @@
 -- Studio上の名前: ThreatManager
 -- 種別: ModuleScript
 --
--- 段階(★)の政策。累計スコアを監視して閾値を跨いだら昇格し、
+-- 段階(★)の政策。Total MAP破壊率を監視して閾値を跨いだら昇格し、
 -- Config.Threat.Stages の編成をEnemyManagerへ指示する。
 -- 敵1体1体の挙動には一切関与しない(EnemyManagerの仕事)。
 --------------------------------------------------------------------
@@ -13,7 +13,7 @@ local Config = require(ReplicatedStorage:WaitForChild("Config"))
 
 local ThreatManager = {}
 
--- Init()で注入される依存: { getScore()->number, enemies(EnemyManager),
+-- Init()で注入される依存: { getMapDestructionRate()->number, enemies(EnemyManager),
 --   hudRemote, effectRemote, onFinalReached(stageDef) }
 local deps = nil
 
@@ -81,8 +81,9 @@ local function promote(n)
 	deps.effectRemote:FireAllClients("threatUp", { sound = def.Sound })
 
 	if Config.Threat.DebugLog then
-		print(("[ThreatManager] %s に到達 (開始から %.1f 秒 / スコア %d)")
-			:format(def.Name, os.clock() - roundStartClock, deps.getScore()))
+		local mapRate = if deps.getMapDestructionRate then deps.getMapDestructionRate() else 0
+		print(("[ThreatManager] %s に到達 (開始から %.1f 秒 / MAP破壊率 %.1f%%)")
+			:format(def.Name, os.clock() - roundStartClock, math.max(tonumber(mapRate) or 0, 0) * 100))
 	end
 
 	local startsFinalPhase = def.FinalPhase == true or def.Encounter == "Kaiju"
@@ -150,17 +151,27 @@ end
 --------------------------------------------------------------------
 -- 監視ループ
 --------------------------------------------------------------------
+local function evaluateProgress()
+	if not Config.Threat.Enabled or finalPhase then
+		return
+	end
+
+	local stages = Config.Threat.Stages
+	local mapRate = if deps.getMapDestructionRate then deps.getMapDestructionRate() else 0
+	mapRate = math.max(tonumber(mapRate) or 0, 0)
+	-- whileにする: 一気に閾値を跨いだ場合でも段階を飛ばさない。
+	-- if stage==1 then... のような段階固定の分岐は書かない(配列を昇順に走査するだけ)
+	while stages[stage + 1] and mapRate >= (tonumber(stages[stage + 1].Threshold) or math.huge) do
+		promote(stage + 1)
+	end
+end
+
 local function monitorLoop()
 	local token = roundToken
 	while running and roundToken == token do
 		if Config.Threat.Enabled then
 			local stages = Config.Threat.Stages
-			local score = deps.getScore()
-			-- whileにする: 一気に閾値を跨いだ場合でも段階を飛ばさない。
-			-- if stage==1 then... のような段階固定の分岐は書かない(配列を昇順に走査するだけ)
-			while stages[stage + 1] and score >= stages[stage + 1].Threshold do
-				promote(stage + 1)
-			end
+			evaluateProgress()
 
 			local def = stages[stage]
 			for squadId, schedule in reinforcementSchedules do
@@ -257,6 +268,14 @@ function ThreatManager.Start()
 	})
 
 	task.spawn(monitorLoop)
+end
+
+-- 破壊イベント直後に閾値を再評価するための公開フック。
+-- monitorLoopの定期確認も残し、将来別のMAP破壊経路が増えても取りこぼさない。
+function ThreatManager.Evaluate()
+	if running then
+		evaluateProgress()
+	end
 end
 
 function ThreatManager.Stop()

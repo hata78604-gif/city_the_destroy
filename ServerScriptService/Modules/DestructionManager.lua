@@ -47,12 +47,23 @@ local RUBBLE_MAX_TOTAL = rubbleCfg.MaxTotal or 3000
 local DestructionManager = {}
 local rng = Random.new()
 
--- Init() で注入される依存: { addScore(player, points, category), addTime(delta, reason, player), blastListeners(配列: {fn(ctx), ...}), effectRemote, hudRemote }
+-- Init() で注入される依存: { addScore, addTime(旧API), getRampage, recordPlayerBlock,
+--   addRampage, blastListeners(配列: {fn(ctx), ...}), effectRemote, hudRemote, onMapChanged }
 -- blastListeners は爆風の影響を受けるモジュール群(NPCManager等)。Explode終了時に全員へctxをそのまま渡す
 local deps = nil
 
 -- 建物の破壊状況(MapRuntime.LoadRound() の戻り値をそのまま持つ。棟数が増えても対応)
 local buildings = {}
+
+-- ラウンド内の破壊統計。分母はbuilding.totalの合計、分子はbuilding.destroyedの合計を
+-- 正とし、物理パーツの大きさや体積は参照しない。
+local roundStats = {
+	totalDestroyed = 0,
+	playerDestroyed = 0,
+	npcDestroyed = 0,
+}
+local getRoundStats
+local publishMapStats
 
 -- 瓦礫キュー(古い順)。table.remove を避けるため head/tail 方式
 local queue = {}
@@ -81,7 +92,43 @@ end
 
 -- ラウンド開始時に建物情報をセットする
 function DestructionManager.SetBuildings(info)
-	buildings = info
+	buildings = if typeof(info) == "table" then info else {}
+	roundStats = {
+		totalDestroyed = 0,
+		playerDestroyed = 0,
+		npcDestroyed = 0,
+	}
+	publishMapStats()
+end
+
+getRoundStats = function()
+	local totalBlocks = 0
+	local totalDestroyed = 0
+	for _, building in ipairs(buildings) do
+		totalBlocks += math.max(tonumber(building.total) or 0, 0)
+		totalDestroyed += math.max(tonumber(building.destroyed) or 0, 0)
+	end
+
+	-- building.destroyedを正本として読み直す。roundStatsの分類値は帰属内訳であり、
+	-- TotalDestroyedの計算を分類値の合計に依存させない。
+	roundStats.totalDestroyed = totalDestroyed
+	local rate = if totalBlocks > 0 then totalDestroyed / totalBlocks else 0
+	return {
+		totalBlocks = totalBlocks,
+		totalDestroyed = totalDestroyed,
+		playerDestroyed = roundStats.playerDestroyed,
+		npcDestroyed = roundStats.npcDestroyed,
+		totalRate = rate,
+		playerRate = if totalBlocks > 0 then roundStats.playerDestroyed / totalBlocks else 0,
+		npcRate = if totalBlocks > 0 then roundStats.npcDestroyed / totalBlocks else 0,
+	}
+end
+
+publishMapStats = function()
+	if not deps or not deps.hudRemote then
+		return
+	end
+	deps.hudRemote:FireAllClients("map", getRoundStats())
 end
 
 --------------------------------------------------------------------
@@ -131,28 +178,43 @@ end
 --------------------------------------------------------------------
 local function giveBuildingBonus(player)
 	deps.addScore(player, Config.Score.BuildingBonus, "buildingBonus")
-	if deps.addTime then
-		deps.addTime(Config.Score.BuildingBonusTime, "building", player)
-	end
 end
 
 local function registerDestruction(part, ctx)
-	-- ブロック加点: attackerがいるときだけ。scoreScaleは連鎖ボーナス用(Step0では常に1=無変化)
+	local isPlayerAttacker = ctx.attacker ~= nil
+	-- ブロック加点は、現在のRAMPAGEを先に読み、破壊後の増加は次のブロックから適用する。
 	if ctx.attacker then
-		deps.addScore(ctx.attacker, Config.Score.Block * (ctx.scoreScale or 1), "block")
+		local rampage = if isPlayerAttacker and deps.getRampage
+			then deps.getRampage(ctx.attacker)
+			else 1
+		local blockScore = math.floor(Config.Score.Block * (ctx.scoreScale or 1) * rampage + 0.5)
+		deps.addScore(ctx.attacker, blockScore, "block")
+	end
+	if isPlayerAttacker then
+		if deps.recordPlayerBlock then
+			deps.recordPlayerBlock(ctx.attacker)
+		end
+		if deps.addRampage then
+			deps.addRampage(ctx.attacker, (Config.Rampage and Config.Rampage.GainPerBlock) or 0, "block")
+		end
 	end
 
 	local buildingId = part:GetAttribute("BuildingId")
 	local building = buildingId and buildings[buildingId]
 	if building then
-		-- プレイヤーが壊したブロック数を建物ごとに遅延生成で記録する。
-		-- 戦車が全壊ラインを越えたときだけ参照し、通常の全壊ボーナス経路は変えない。
-		if ctx.attacker then
+		-- プレイヤーが壊したブロック数は既存creditを再利用しつつ、全体の帰属統計も
+		-- 別に保持する。attacker=nilはEnemy/Tank/Kaiju等のNPC側破壊として扱う。
+		if isPlayerAttacker then
 			building.credit = building.credit or {}
 			building.credit[ctx.attacker] = (building.credit[ctx.attacker] or 0) + 1
+			building.playerDestroyed = (building.playerDestroyed or 0) + 1
+			roundStats.playerDestroyed += 1
+		else
+			building.npcDestroyed = (building.npcDestroyed or 0) + 1
+			roundStats.npcDestroyed += 1
 		end
 
-		-- destroyedはattackerの有無に関係なく必ず加算する(敵が壊した分も破壊率に含める。
+		-- destroyedはattackerの有無に関係なく必ず1回だけ加算する(敵が壊した分も破壊率に含める。
 		-- 含めないと「敵に半分壊された建物はプレイヤーが残りを全部壊しても90%に届かない」
 		-- という理不尽なバグになる。THREAT_DESIGN_PROPOSAL.md §5-3付録(2)参照)
 		building.destroyed += 1
@@ -180,6 +242,10 @@ local function registerDestruction(part, ctx)
 			-- 建物崩壊の粉塵演出
 			deps.effectRemote:FireAllClients("collapse", { position = building.center })
 			print(("[DestructionManager] %s 全壊!"):format(building.name))
+		end
+		publishMapStats()
+		if deps.onMapChanged then
+			deps.onMapChanged()
 		end
 	end
 end
@@ -426,7 +492,11 @@ function DestructionManager.Explode(ctx)
 
 	-- 演出はクライアント側で再生する(火花・煙・閃光は EffectsClient 側)
 	if not ctx.silent then
-		deps.effectRemote:FireAllClients("explosion", { position = position, radius = radius })
+		deps.effectRemote:FireAllClients("explosion", {
+			position = position,
+			radius = radius,
+			source = ctx.source,
+		})
 	end
 
 	-- 半径内の破壊対象ブロックを取得
@@ -515,10 +585,22 @@ function DestructionManager.GetBuildingStats()
 	for _, building in ipairs(buildings) do
 		table.insert(list, {
 			name = building.name,
+			total = building.total,
+			destroyed = building.destroyed,
+			playerDestroyed = building.playerDestroyed or 0,
+			npcDestroyed = building.npcDestroyed or 0,
 			rate = math.floor(building.destroyed / math.max(building.total, 1) * 100),
 		})
 	end
 	return list
+end
+
+function DestructionManager.GetRoundStats()
+	return getRoundStats()
+end
+
+function DestructionManager.GetMapDestructionRate()
+	return getRoundStats().totalRate
 end
 
 -- 残っている瓦礫をすべて即時削除する(ラウンド終了時)

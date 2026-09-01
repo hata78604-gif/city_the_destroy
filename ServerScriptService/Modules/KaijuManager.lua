@@ -20,6 +20,7 @@ local KaijuManager = {}
 
 local deps = {
 	addTime = nil,
+	applyRampagePenalty = nil,
 	explode = nil,
 	addScore = nil,
 	hudRemote = nil,
@@ -34,6 +35,7 @@ local DEFAULT_SUBMERGE_RATIO = 1.1
 local BOUNDS_KEYS = { "minX", "maxX", "minY", "maxY", "minZ", "maxZ" }
 
 local generation = 0
+local attackSequence = 0
 local motionActive = false
 local heartbeatConnection = nil
 local activeModel = nil
@@ -443,6 +445,8 @@ local function calculateSpawnCFrames(model, spawnPoint, direction, yawOffset, co
 		start = makeFacingCFrame(submergedPosition, direction, yawOffset),
 		fullyEmerged = makeFacingCFrame(fullyEmergedPosition, direction, yawOffset),
 		boxHeight = boxSize.Y,
+		boundsCFrame = boxCFrame,
+		boundsSize = boxSize,
 		bottomOffsetY = bottomOffsetY,
 		topOffsetY = topOffsetY,
 		startDepth = startDepth,
@@ -473,7 +477,11 @@ local function getHealthSettings(config)
 	local damage = if typeof(health.Damage) == "table" then health.Damage else {}
 	local score = if typeof(health.Score) == "table" then health.Score else {}
 	local death = if typeof(health.Death) == "table" then health.Death else {}
-	local maxHP = math.floor(nonNegative(health.MaxHP, 100))
+	local maxHPValue = health.MaxHP
+	if not finitePositive(maxHPValue) then
+		return nil, "Config.Kaiju.Health.MaxHP が正の有限数ではありません"
+	end
+	local maxHP = math.floor(maxHPValue)
 	if maxHP < 1 then
 		maxHP = 1
 	end
@@ -484,11 +492,13 @@ local function getHealthSettings(config)
 		defeatScore = nonNegative(score.Defeat, 0),
 		holdDuration = nonNegative(death.HoldDuration, 2),
 		fadeDuration = nonNegative(death.FadeDuration, 1),
-	}
+	}, nil
 end
 
-local function createHitbox(model, config)
-	local boundsCFrame, boundsSize = model:GetBoundingBox()
+local function createHitbox(model, config, boundsCFrame, boundsSize)
+	if typeof(boundsCFrame) ~= "CFrame" or typeof(boundsSize) ~= "Vector3" then
+		boundsCFrame, boundsSize = model:GetBoundingBox()
+	end
 	local hitboxConfig = if typeof(config.Hitbox) == "table" then config.Hitbox else {}
 	local scale = hitboxConfig.SizeScale
 	if typeof(scale) ~= "Vector3" then
@@ -558,6 +568,35 @@ local function setAttackPhase(model, phase)
 	end
 end
 
+local function getRampagePenalty(attackType)
+	local rampage = Config.Rampage
+	local penalties = if typeof(rampage) == "table" then rampage.Penalties else nil
+	return math.max(tonumber(penalties and penalties[attackType]) or 0, 0)
+end
+
+local function getEffectRemote()
+	local remotes = ReplicatedStorage:FindFirstChild("Remotes")
+	local effectRemote = remotes and remotes:FindFirstChild("Effect")
+	if effectRemote and effectRemote:IsA("RemoteEvent") then
+		return effectRemote
+	end
+	return nil
+end
+
+local function fireEffect(effectType, data)
+	local effectRemote = getEffectRemote()
+	if not effectRemote then
+		return false
+	end
+	local ok, err = pcall(function()
+		effectRemote:FireAllClients(effectType, data)
+	end)
+	if not ok then
+		warn(("[KaijuManager] %sエフェクト通知に失敗しました: %s"):format(effectType, tostring(err)))
+	end
+	return ok
+end
+
 local function findNearestPlayer(origin)
 	local nearestPlayer = nil
 	local nearestRoot = nil
@@ -579,50 +618,56 @@ local function findNearestPlayer(origin)
 	return nearestPlayer, nearestRoot, nearestDistance
 end
 
-local function isInsideBox(point, boxCFrame, boxSize)
-	local localPosition = boxCFrame:PointToObjectSpace(point)
-	return math.abs(localPosition.X) <= boxSize.X * 0.5
-		and math.abs(localPosition.Y) <= boxSize.Y * 0.5
-		and math.abs(localPosition.Z) <= boxSize.Z * 0.5
+local function faceTarget(runtime, targetRoot)
+	if not isCurrent(runtime.token, runtime.model)
+		or not targetRoot
+		or not targetRoot:IsA("BasePart") then
+		return false
+	end
+
+	local currentCFrame = runtime.model:GetPivot()
+	local direction = horizontalDirection(targetRoot.Position - currentCFrame.Position)
+	if not direction then
+		direction = horizontalDirection(currentCFrame.LookVector)
+			or Vector3.new(0, 0, -1)
+	end
+
+	-- Target elevation is intentionally ignored: only yaw changes, so the model
+	-- does not pitch or roll toward a player on a different Y level.
+	runtime.model:PivotTo(makeFacingCFrame(currentCFrame.Position, direction, runtime.yawOffset))
+	return isCurrent(runtime.token, runtime.model)
 end
 
-local function calculateFireBox(runtime, fireConfig)
-	local direction = runtime.fireDirection
-	local pivot = runtime.model:GetPivot()
-	local boundsCFrame, boundsSize = runtime.model:GetBoundingBox()
-	local mouthDistance = math.max(2, boundsSize.Z * 0.5)
-	local origin = pivot.Position + direction * mouthDistance
-	local range = nonNegative(fireConfig.Range, 100)
-	local width = nonNegative(fireConfig.Width, 20)
-	local height = nonNegative(fireConfig.Height, 24)
-	local center = Vector3.new(origin.X, boundsCFrame.Position.Y, origin.Z) + direction * (range * 0.5)
-	local boxCFrame = CFrame.lookAt(center, center + direction)
-	return boxCFrame, Vector3.new(width, height, range), origin
+local function setFireballCharge(runtime, enabled)
+	if not runtime or not runtime.model then
+		return
+	end
+	local head = runtime.model:FindFirstChild("Head", true)
+	local origin = head and head:FindFirstChild("BreathOrigin", true)
+		or runtime.model:FindFirstChild("BreathOrigin", true)
+	if not origin then
+		return
+	end
+	for _, instance in origin:GetDescendants() do
+		if instance.Name == "ChargeEmitter" and instance:IsA("ParticleEmitter") then
+			instance.Enabled = enabled
+		elseif instance.Name == "ChargeLight" and instance:IsA("Light") then
+			instance.Enabled = enabled
+		end
+	end
 end
 
-local function createBreathVfx(runtime, boxCFrame, boxSize)
-	local vfx = Instance.new("Part")
-	vfx.Name = "FireBreathPreview"
-	vfx.Size = boxSize
-	vfx.CFrame = boxCFrame
-	vfx.Anchored = true
-	vfx.CanCollide = false
-	vfx.CanTouch = false
-	vfx.CanQuery = false
-	vfx.CastShadow = false
-	vfx.Material = Enum.Material.Neon
-	vfx.Color = Color3.fromRGB(255, 100, 20)
-	vfx.Transparency = 0.65
-	vfx.Parent = activeFolder
-	runtime.fireVfx = vfx
-end
-
-local function destroyBreathVfx(runtime)
-	if runtime.fireVfx then
-		pcall(function()
-			runtime.fireVfx:Destroy()
-		end)
-		runtime.fireVfx = nil
+local function cancelFireballBarrage(runtime, cancelGeneration)
+	if not runtime then
+		return
+	end
+	setFireballCharge(runtime, false)
+	if runtime.fireballAttackId then
+		fireEffect("TargetWarningCancel", {
+			attackId = runtime.fireballAttackId,
+			generation = cancelGeneration or runtime.token,
+		})
+		runtime.fireballAttackId = nil
 	end
 end
 
@@ -717,7 +762,7 @@ local function defeat(runtime, attacker)
 	runtime.model:SetAttribute("KaijuDead", true)
 	setState(runtime.model, "dead")
 	setAttackPhase(runtime.model, nil)
-	destroyBreathVfx(runtime)
+	cancelFireballBarrage(runtime)
 	stopManagedAnimationTracks()
 	motionActive = false
 	activeMotion = nil
@@ -739,16 +784,61 @@ local function defeat(runtime, attacker)
 end
 
 local function addPlayerPenalty(runtime, player, amount, reason)
-	if not isCurrent(runtime.token, runtime.model) or not deps.addTime then
+	if not isCurrent(runtime.token, runtime.model) or not deps.applyRampagePenalty then
 		return
 	end
-	local ok, err = pcall(deps.addTime, -amount, reason, player)
+	local ok, err = pcall(deps.applyRampagePenalty, player, amount, reason)
 	if not ok then
-		warn(("[KaijuManager] %sの時間減少に失敗しました: %s"):format(reason, tostring(err)))
+		warn(("[KaijuManager] %sのRAMPAGE減少に失敗しました: %s"):format(reason, tostring(err)))
 	end
 end
 
-local function explodeForKaiju(runtime, position, radius, source)
+local function getFireballTarget(runtime)
+	local targetPlayer = runtime.attackTarget
+	if isActivePlayer(targetPlayer) then
+		local character = targetPlayer.Character
+		local humanoid = character and character:FindFirstChildOfClass("Humanoid")
+		local root = character and character:FindFirstChild("HumanoidRootPart")
+		if humanoid and root and root:IsA("BasePart") and humanoid.Health > 0 then
+			return targetPlayer, root
+		end
+	end
+
+	local nearestPlayer, nearestRoot = findNearestPlayer(runtime.model:GetPivot().Position)
+	if nearestPlayer then
+		runtime.attackTarget = nearestPlayer
+	end
+	return nearestPlayer, nearestRoot
+end
+
+local function resolveFireballGroundPosition(runtime, targetRoot)
+	if not targetRoot or not targetRoot:IsA("BasePart") then
+		return nil
+	end
+
+	local excluded = { runtime.model, runtime.folder }
+	for _, player in Players:GetPlayers() do
+		if player.Character then
+			table.insert(excluded, player.Character)
+		end
+	end
+	local rayParams = RaycastParams.new()
+	rayParams.FilterType = Enum.RaycastFilterType.Exclude
+	rayParams.FilterDescendantsInstances = excluded
+	rayParams.IgnoreWater = true
+
+	local targetPosition = targetRoot.Position
+	local result = workspace:Raycast(
+		targetPosition + Vector3.new(0, 128, 0),
+		Vector3.new(0, -512, 0),
+		rayParams)
+	if result then
+		return result.Position + Vector3.new(0, 0.05, 0)
+	end
+	return Vector3.new(targetPosition.X, targetPosition.Y - 3, targetPosition.Z)
+end
+
+local function explodeForKaiju(runtime, position, radius, source, attackId, shotIndex)
 	if not isCurrent(runtime.token, runtime.model) or not deps.explode then
 		return false
 	end
@@ -758,61 +848,90 @@ local function explodeForKaiju(runtime, position, radius, source)
 		attacker = nil,
 		source = source,
 		bonusPolicy = "deny",
+		silent = true,
 	})
 	if not ok then
 		warn(("[KaijuManager] %sの建物破壊に失敗しました: %s"):format(source, tostring(err)))
+		return false
 	end
-	return ok
+	if not isCurrent(runtime.token, runtime.model) then
+		return false
+	end
+	fireEffect("Impact", {
+		position = position,
+		radius = radius,
+		attackId = attackId,
+		generation = runtime.token,
+		shotIndex = shotIndex,
+	})
+	return true
 end
 
-local function resolveFireBreath(runtime)
-	if runtime.fireResolved or not isCurrent(runtime.token, runtime.model) then
+local function resolveFireballImpact(runtime, shot)
+	if shot.impacted or not shot.position or not isCurrent(runtime.token, runtime.model) then
 		return
 	end
-	runtime.fireResolved = true
+	shot.impacted = true
 
-	local fireConfig = getAttackConfig(getConfig(), "FireBreath")
-	local boxCFrame, boxSize, origin = calculateFireBox(runtime, fireConfig)
-	runtime.fireBoxCFrame = boxCFrame
-	runtime.fireBoxSize = boxSize
-	runtime.fireOrigin = origin
-
+	local radius = runtime.fireballExplosionRadius
+	local penalty = runtime.fireballRampagePenalty
 	local playerHits = 0
 	for _, player in Players:GetPlayers() do
 		local character = player.Character
 		local humanoid = character and character:FindFirstChildOfClass("Humanoid")
 		local root = character and character:FindFirstChild("HumanoidRootPart")
 		if humanoid and root and root:IsA("BasePart") and humanoid.Health > 0
-			and not runtime.fireHitPlayers[player]
-			and isInsideBox(root.Position, boxCFrame, boxSize) then
-			runtime.fireHitPlayers[player] = true
+			and (root.Position - shot.position).Magnitude <= radius then
 			playerHits += 1
-			addPlayerPenalty(runtime, player, nonNegative(fireConfig.PlayerPenalty, 5), "kaijuFireBreath")
+			addPlayerPenalty(runtime, player, penalty, "KaijuFireball")
 		end
 	end
-	runtime.firePlayerHits = playerHits
-
-	local spacing = nonNegative(fireConfig.BuildingBlastSpacing, 20)
-	local range = boxSize.Z
-	local blastRadius = nonNegative(fireConfig.BuildingBlastRadius, 10)
-	local maximum = math.floor(nonNegative(fireConfig.MaxBuildingExplosions, 8))
-	if spacing > 0 and range > 0 and blastRadius > 0 and maximum > 0 then
-		local count = math.min(math.ceil(range / spacing), maximum)
-		for index = 1, count do
-			if not isCurrent(runtime.token, runtime.model) then
-				return
-			end
-			local distance = math.min(range, index * spacing)
-			local position = origin + runtime.fireDirection * distance
-			runtime.fireExplosionCount += 1
-			explodeForKaiju(runtime, position, blastRadius, "KaijuFireBreath")
-		end
-	end
+	shot.playerHits = playerHits
+	runtime.fireballPlayerHits += playerHits
+	runtime.fireballExplosionCount += 1
+	explodeForKaiju(
+		runtime,
+		shot.position,
+		radius,
+		"KaijuFireballBarrage",
+		runtime.fireballAttackId,
+		shot.index)
 
 	if isCurrent(runtime.token, runtime.model) then
-		runtime.model:SetAttribute("KaijuLastFireBreathPlayerHits", playerHits)
-		runtime.model:SetAttribute("KaijuLastFireBreathExplosions", runtime.fireExplosionCount)
+		runtime.model:SetAttribute("KaijuLastFireballBarragePlayerHits", runtime.fireballPlayerHits)
+		runtime.model:SetAttribute("KaijuLastFireballBarrageExplosions", runtime.fireballExplosionCount)
 	end
+end
+
+local function startFireballShot(runtime, shotIndex)
+	if not isCurrent(runtime.token, runtime.model) then
+		return false
+	end
+
+	local shot = {
+		index = shotIndex,
+		startedAt = runtime.attackElapsed,
+		impactAt = runtime.attackElapsed + runtime.fireballWarningTime,
+		position = nil,
+		impacted = false,
+	}
+	runtime.fireballShots[shotIndex] = shot
+
+	local targetPlayer, targetRoot = getFireballTarget(runtime)
+	if targetPlayer and targetRoot then
+		shot.position = resolveFireballGroundPosition(runtime, targetRoot)
+		if shot.position then
+			fireEffect("TargetWarning", {
+				position = shot.position,
+				radius = runtime.fireballExplosionRadius,
+				duration = runtime.fireballWarningTime,
+				attackId = runtime.fireballAttackId,
+				generation = runtime.token,
+				shotIndex = shotIndex,
+			})
+		end
+	end
+	return true
 end
 
 local function resolveTailSpin(runtime)
@@ -823,7 +942,7 @@ local function resolveTailSpin(runtime)
 	local config = getAttackConfig(getConfig(), "TailSpin")
 	local boundsCFrame = runtime.model:GetBoundingBox()
 	local center = boundsCFrame.Position
-	local radius = nonNegative(config.Radius, 30)
+	local radius = nonNegative(config.Radius, 0)
 	local playerHits = 0
 	for _, player in Players:GetPlayers() do
 		local character = player.Character
@@ -836,7 +955,7 @@ local function resolveTailSpin(runtime)
 			if horizontalDistance <= radius and math.abs(offset.Y) <= radius then
 				runtime.spinHitPlayers[player] = true
 				playerHits += 1
-				addPlayerPenalty(runtime, player, nonNegative(config.PlayerPenalty, 8), "kaijuTailSpin")
+				addPlayerPenalty(runtime, player, getRampagePenalty("KaijuTailSpin"), "KaijuTailSpin")
 			end
 		end
 	end
@@ -858,7 +977,7 @@ local function finishIdle(runtime, hasCooldown)
 		return
 	end
 
-	destroyBreathVfx(runtime)
+	cancelFireballBarrage(runtime)
 	runtime.phase = "idle"
 	runtime.thinkElapsed = 0
 	runtime.cooldownRemaining = if hasCooldown then runtime.attackCooldown else 0
@@ -870,37 +989,54 @@ local function finishIdle(runtime, hasCooldown)
 	publishRuntimeHP(runtime, true)
 end
 
-local function beginFireBreath(runtime, targetPlayer, targetRoot)
+local function beginFireballBarrage(runtime, targetPlayer, targetRoot)
+	if not isCurrent(runtime.token, runtime.model) then
+		return false
+	end
+
 	local config = getConfig()
-	local fireConfig = getAttackConfig(config, "FireBreath")
+	local fireConfig = getAttackConfig(config, "FireballBarrage")
+	if not faceTarget(runtime, targetRoot) then
+		return false
+	end
 	local currentCFrame = runtime.model:GetPivot()
-	local direction = horizontalDirection(targetRoot.Position - currentCFrame.Position)
-		or horizontalDirection(currentCFrame.LookVector)
+	local direction = horizontalDirection(currentCFrame.LookVector)
 		or Vector3.new(0, 0, -1)
-	local facing = CFrame.lookAt(currentCFrame.Position, currentCFrame.Position + direction)
-		* CFrame.Angles(0, math.rad(runtime.yawOffset), 0)
-	runtime.model:PivotTo(facing)
-	runtime.fireDirection = horizontalDirection(facing.LookVector) or direction
+	runtime.fireDirection = direction
 	runtime.attackTarget = targetPlayer
-	runtime.phase = "fireBreath"
+	attackSequence += 1
+	runtime.fireballAttackId = ("%d-%d"):format(runtime.token, attackSequence)
+	runtime.phase = "fireballBarrage"
 	runtime.attackElapsed = 0
-	runtime.fireWindup = nonNegative(fireConfig.Windup, 0.8)
-	runtime.fireActiveDuration = nonNegative(fireConfig.ActiveDuration, 2)
-	runtime.fireRecovery = nonNegative(fireConfig.Recovery, 0.4)
-	runtime.fireHitPlayers = {}
-	runtime.firePlayerHits = 0
-	runtime.fireExplosionCount = 0
-	runtime.fireResolved = false
-	runtime.fireRecoveryStarted = false
-	runtime.fireVfx = nil
-	setState(runtime.model, "fireBreath")
+	runtime.fireballWindup = nonNegative(fireConfig.Windup, 0.8)
+	runtime.fireballWarningTime = nonNegative(fireConfig.WarningTime, 1.2)
+	runtime.fireballShotCount = math.floor(math.clamp(
+		nonNegative(fireConfig.ShotCount, 3), 0, 32))
+	runtime.fireballShotInterval = nonNegative(fireConfig.ShotInterval, 0.45)
+	runtime.fireballExplosionRadius = nonNegative(fireConfig.ExplosionRadius, 14)
+	runtime.fireballRampagePenalty = getRampagePenalty("KaijuFireball")
+	runtime.fireballRecovery = nonNegative(fireConfig.Recovery, 0.4)
+	runtime.fireballShots = {}
+	runtime.fireballNextShotIndex = 1
+	runtime.fireballPlayerHits = 0
+	runtime.fireballExplosionCount = 0
+	runtime.fireballWindupEnded = false
+	runtime.fireballRecoveryStarted = false
+	setState(runtime.model, "fireballBarrage")
 	setAttackPhase(runtime.model, "windup")
-	local boxCFrame, boxSize = calculateFireBox(runtime, fireConfig)
-	createBreathVfx(runtime, boxCFrame, boxSize)
+	setFireballCharge(runtime, true)
 	playAnimation("FireBreath", false, Enum.AnimationPriority.Action)
+	return true
 end
 
-local function beginTailSpin(runtime, targetPlayer)
+local function beginTailSpin(runtime, targetPlayer, targetRoot)
+	if not isCurrent(runtime.token, runtime.model) then
+		return false
+	end
+	if not faceTarget(runtime, targetRoot) then
+		return false
+	end
+
 	local config = getAttackConfig(getConfig(), "TailSpin")
 	runtime.attackTarget = targetPlayer
 	runtime.phase = "tailSpin"
@@ -916,33 +1052,77 @@ local function beginTailSpin(runtime, targetPlayer)
 	setState(runtime.model, "tailSpin")
 	setAttackPhase(runtime.model, "windup")
 	stopManagedAnimationTracks()
+	return true
 end
 
-local function advanceFireBreath(runtime, dt)
+local function beginSelectedAttack(runtime, targetPlayer, targetRoot, distance, combatOrigin)
+	if not isCurrent(runtime.token, runtime.model) then
+		return false
+	end
+
+	runtime.combatOrigin = combatOrigin
+	runtime.thinkElapsed = 0
+	if distance <= runtime.tailSpinTriggerRange then
+		return beginTailSpin(runtime, targetPlayer, targetRoot)
+	end
+	return beginFireballBarrage(runtime, targetPlayer, targetRoot)
+end
+
+local function advanceFireballBarrage(runtime, dt)
+	if not isCurrent(runtime.token, runtime.model) then
+		return
+	end
 	runtime.attackElapsed += dt
-	local activeEnd = runtime.fireWindup + runtime.fireActiveDuration
-	local recoveryEnd = activeEnd + runtime.fireRecovery
-	if runtime.attackElapsed < runtime.fireWindup then
+	if runtime.attackElapsed < runtime.fireballWindup then
 		return
 	end
-	if not runtime.fireResolved then
+	if not runtime.fireballWindupEnded then
+		runtime.fireballWindupEnded = true
+		setFireballCharge(runtime, false)
 		setAttackPhase(runtime.model, "active")
-		resolveFireBreath(runtime)
 	end
-	if runtime.attackElapsed < activeEnd then
-		return
+
+	while runtime.fireballNextShotIndex <= runtime.fireballShotCount do
+		local shotIndex = runtime.fireballNextShotIndex
+		local shotStart = runtime.fireballWindup
+			+ (shotIndex - 1) * runtime.fireballShotInterval
+		if runtime.attackElapsed < shotStart then
+			break
+		end
+		startFireballShot(runtime, shotIndex)
+		runtime.fireballNextShotIndex += 1
 	end
-	if not runtime.fireRecoveryStarted then
-		runtime.fireRecoveryStarted = true
-		destroyBreathVfx(runtime)
-		setAttackPhase(runtime.model, "recovery")
+
+	for shotIndex = 1, runtime.fireballShotCount do
+		local shot = runtime.fireballShots[shotIndex]
+		if shot and not shot.impacted and runtime.attackElapsed >= shot.impactAt then
+			resolveFireballImpact(runtime, shot)
+			if not isCurrent(runtime.token, runtime.model) then
+				return
+			end
+		end
 	end
-	if runtime.attackElapsed >= recoveryEnd then
-		finishIdle(runtime, true)
+
+	local lastImpactAt = runtime.fireballWindup
+		+ math.max(runtime.fireballShotCount - 1, 0) * runtime.fireballShotInterval
+		+ runtime.fireballWarningTime
+	local recoveryEnd = lastImpactAt + runtime.fireballRecovery
+	if runtime.attackElapsed >= lastImpactAt then
+		if not runtime.fireballRecoveryStarted then
+			runtime.fireballRecoveryStarted = true
+			cancelFireballBarrage(runtime)
+			setAttackPhase(runtime.model, "recovery")
+		end
+		if runtime.attackElapsed >= recoveryEnd then
+			finishIdle(runtime, true)
+		end
 	end
 end
 
 local function advanceTailSpin(runtime, dt)
+	if not isCurrent(runtime.token, runtime.model) then
+		return
+	end
 	runtime.attackElapsed += dt
 	if runtime.attackElapsed < runtime.spinWindup then
 		return
@@ -957,15 +1137,41 @@ local function advanceTailSpin(runtime, dt)
 		-- 常に開始CFrameを最後に適用し、累積誤差を残さない。
 		runtime.model:PivotTo(runtime.spinStartCFrame)
 		resolveTailSpin(runtime)
-		if isCurrent(runtime.token, runtime.model) then
-			runtime.model:SetAttribute("KaijuLastTailSpinDegrees", 360)
-			runtime.model:SetAttribute("KaijuLastTailSpinDuration", runtime.spinElapsed)
+		if not isCurrent(runtime.token, runtime.model) then
+			return
 		end
+		runtime.model:SetAttribute("KaijuLastTailSpinDegrees", 360)
+		runtime.model:SetAttribute("KaijuLastTailSpinDuration", runtime.spinElapsed)
 		finishIdle(runtime, true)
 	end
 end
 
+local function resumeMoving(runtime)
+	if not isCurrent(runtime.token, runtime.model) then
+		return false
+	end
+
+	cancelFireballBarrage(runtime)
+	runtime.phase = "moving"
+	runtime.elapsed = 0
+	runtime.thinkElapsed = 0
+	runtime.cooldownRemaining = 0
+	runtime.attackElapsed = 0
+	runtime.spinElapsed = 0
+	runtime.attackTarget = nil
+	runtime.combatOrigin = nil
+	setAttackPhase(runtime.model, nil)
+	setState(runtime.model, "moving")
+	playAnimation("Walk", true, Enum.AnimationPriority.Movement)
+	publishRuntimeHP(runtime, true)
+	return true
+end
+
 local function advanceCombat(runtime, dt)
+	if not isCurrent(runtime.token, runtime.model) then
+		return
+	end
+
 	if runtime.phase == "idle" then
 		if runtime.cooldownRemaining > 0 then
 			runtime.cooldownRemaining = math.max(runtime.cooldownRemaining - dt, 0)
@@ -977,16 +1183,17 @@ local function advanceCombat(runtime, dt)
 		end
 		runtime.thinkElapsed = 0
 		local targetPlayer, targetRoot, distance = findNearestPlayer(runtime.model:GetPivot().Position)
-		if not targetPlayer or not targetRoot then
+		if runtime.combatOrigin == "moving" then
+			if not targetPlayer or not targetRoot or distance > runtime.aggroRange then
+				resumeMoving(runtime)
+				return
+			end
+		elseif not targetPlayer or not targetRoot then
 			return
 		end
-		if distance <= runtime.tailSpinRange then
-			beginTailSpin(runtime, targetPlayer)
-		else
-			beginFireBreath(runtime, targetPlayer, targetRoot)
-		end
-	elseif runtime.phase == "fireBreath" then
-		advanceFireBreath(runtime, dt)
+		beginSelectedAttack(runtime, targetPlayer, targetRoot, distance, runtime.combatOrigin)
+	elseif runtime.phase == "fireballBarrage" then
+		advanceFireballBarrage(runtime, dt)
 	elseif runtime.phase == "tailSpin" then
 		advanceTailSpin(runtime, dt)
 	end
@@ -1020,6 +1227,16 @@ local function advanceMotion(runtime, dt)
 	end
 
 	if runtime.phase == "moving" then
+		runtime.thinkElapsed += dt
+		if runtime.thinkInterval <= 0 or runtime.thinkElapsed >= runtime.thinkInterval then
+			runtime.thinkElapsed = 0
+			local targetPlayer, targetRoot, distance = findNearestPlayer(runtime.model:GetPivot().Position)
+			if targetPlayer and targetRoot and distance <= runtime.aggroRange then
+				beginSelectedAttack(runtime, targetPlayer, targetRoot, distance, "moving")
+				return
+			end
+		end
+
 		local currentPosition = runtime.model:GetPivot().Position
 		local toCenter = Vector3.new(
 			runtime.center.X - currentPosition.X,
@@ -1046,6 +1263,7 @@ end
 
 function KaijuManager.Init(newDeps)
 	deps.addTime = newDeps and newDeps.addTime or nil
+	deps.applyRampagePenalty = newDeps and newDeps.applyRampagePenalty or nil
 	deps.explode = newDeps and newDeps.explode or nil
 	deps.addScore = newDeps and newDeps.addScore or nil
 	deps.hudRemote = newDeps and newDeps.hudRemote or nil
@@ -1062,7 +1280,7 @@ function KaijuManager.ApplyDamage(player, amount, source)
 		return false, 0
 	end
 	if not isActivePlayer(player)
-		or (source ~= "Bazooka" and source ~= "Airstrike")
+		or (source ~= "Bazooka" and source ~= "Airstrike" and source ~= "MultiLockLauncher")
 		or not finitePositive(amount) then
 		return false, 0
 	end
@@ -1085,7 +1303,9 @@ end
 
 function KaijuManager.OnExplosion(context)
 	if typeof(context) ~= "table"
-		or (context.source ~= "Bazooka" and context.source ~= "Airstrike") then
+		or (context.source ~= "Bazooka"
+			and context.source ~= "Airstrike"
+			and context.source ~= "MultiLockLauncher") then
 		return false, 0
 	end
 	local config = getConfig()
@@ -1218,6 +1438,21 @@ function KaijuManager.Start()
 		return false
 	end
 
+	local configuredScale = config.Scale
+	if not finitePositive(configuredScale) then
+		model:Destroy()
+		warn("[KaijuManager] Config.Kaiju.Scale が正の有限数ではありません")
+		return false
+	end
+	local scaleOk, scaleError = pcall(function()
+		model:ScaleTo(configuredScale)
+	end)
+	if not scaleOk then
+		model:Destroy()
+		warn("[KaijuManager] Config.KaijuのScale適用に失敗しました: " .. tostring(scaleError))
+		return false
+	end
+
 	local toCenter = Vector3.new(
 		mapContext.center.X - spawnPoint.position.X,
 		0,
@@ -1230,10 +1465,16 @@ function KaijuManager.Start()
 	local riseDuration, postRiseDelay, intro = getIntroSettings(config)
 	local speed, stopDistance, yawOffset = getMovementSettings(config)
 	local combatConfig = if typeof(config.Combat) == "table" then config.Combat else {}
-	local thinkInterval = nonNegative(combatConfig.ThinkInterval, 0.25)
-	local tailSpinRange = nonNegative(combatConfig.TailSpinRange, 30)
-	local attackCooldown = nonNegative(combatConfig.AttackCooldown, 2)
-	local healthSettings = getHealthSettings(config)
+	local thinkInterval = nonNegative(combatConfig.ThinkInterval, 0)
+	local tailSpinTriggerRange = nonNegative(combatConfig.TailSpinRange, 0)
+	local attackCooldown = nonNegative(combatConfig.AttackCooldown, 0)
+	local aggroRange = nonNegative(combatConfig.AggroRange, 0)
+	local healthSettings, healthError = getHealthSettings(config)
+	if not healthSettings then
+		model:Destroy()
+		warn("[KaijuManager] " .. tostring(healthError))
+		return false
+	end
 	local cframes, cframeError = calculateSpawnCFrames(
 		model,
 		spawnPoint,
@@ -1246,6 +1487,19 @@ function KaijuManager.Start()
 		warn("[KaijuManager] " .. cframeError)
 		return false
 	end
+
+	local hitboxOk, hitboxOrError = pcall(
+		createHitbox,
+		model,
+		config,
+		cframes.boundsCFrame,
+		cframes.boundsSize)
+	if not hitboxOk then
+		model:Destroy()
+		warn("[KaijuManager] KaijuHitboxの生成に失敗しました: " .. tostring(hitboxOrError))
+		return false
+	end
+	local hitbox = hitboxOrError
 
 	local folder = Instance.new("Folder")
 	folder.Name = runtimeFolderName
@@ -1260,15 +1514,6 @@ function KaijuManager.Start()
 	model.Parent = folder
 	-- HumanoidがParent直後にTorsoのCanCollideを戻すことがあるため、最終状態を再適用する。
 	ensurePhysics(model, rootPart)
-	local hitboxOk, hitboxOrError = pcall(createHitbox, model, config)
-	if not hitboxOk then
-		model:Destroy()
-		folder:Destroy()
-		warn("[KaijuManager] KaijuHitboxの生成に失敗しました: " .. tostring(hitboxOrError))
-		return false
-	end
-	local hitbox = hitboxOrError
-
 	activeFolder = folder
 	activeModel = model
 	motionActive = true
@@ -1276,6 +1521,8 @@ function KaijuManager.Start()
 	loadConfiguredAnimations(config)
 	model:SetAttribute("KaijuMaxHP", healthSettings.maxHP)
 	model:SetAttribute("KaijuCurrentHP", healthSettings.maxHP)
+	model:SetAttribute("KaijuScale", configuredScale)
+	model:SetAttribute("KaijuAggroRange", aggroRange)
 	model:SetAttribute("KaijuDead", false)
 	setState(model, "intro")
 
@@ -1296,7 +1543,8 @@ function KaijuManager.Start()
 		yawOffset = yawOffset,
 		rootPart = rootPart,
 		thinkInterval = thinkInterval,
-		tailSpinRange = tailSpinRange,
+		tailSpinTriggerRange = tailSpinTriggerRange,
+		aggroRange = aggroRange,
 		attackCooldown = attackCooldown,
 		thinkElapsed = 0,
 		cooldownRemaining = 0,
@@ -1313,14 +1561,17 @@ function KaijuManager.Start()
 
 	heartbeatConnection = RunService.Heartbeat:Connect(function(dt)
 		if not isCurrent(token, model) then
+			cancelFireballBarrage(runtime)
 			disconnectHeartbeat()
+			motionActive = false
+			activeMotion = nil
 			return
 		end
 
 		ensurePhysics(model, runtime.rootPart)
 		local ok, err = pcall(advanceMotion, runtime, dt)
 		if not ok and isCurrent(token, model) then
-			destroyBreathVfx(runtime)
+			cancelFireballBarrage(runtime)
 			stopManagedAnimationTracks()
 			motionActive = false
 			activeMotion = nil
@@ -1341,7 +1592,7 @@ function KaijuManager.Stop()
 	activeMotion = nil
 	disconnectHeartbeat()
 	if runtime then
-		destroyBreathVfx(runtime)
+		cancelFireballBarrage(runtime, generation)
 	end
 	stopManagedAnimationTracks()
 	if activeModel and activeModel.Parent and activeModel:GetAttribute("KaijuDead") ~= true then
@@ -1363,7 +1614,7 @@ function KaijuManager.Clear()
 	local runtime = activeMotion
 	activeMotion = nil
 	if runtime then
-		destroyBreathVfx(runtime)
+		cancelFireballBarrage(runtime, generation)
 	end
 	stopManagedAnimationTracks()
 	table.clear(animationTracks)

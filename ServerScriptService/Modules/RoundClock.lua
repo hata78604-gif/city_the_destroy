@@ -80,7 +80,7 @@ function RoundClock.Add(delta, reason, player)
 		-- LOBBY/RESULT中や、ラウンド開始前に呼ばれても何もしない
 		return 0
 	end
-	if finalPhase and reason ~= "kaijuFireBreath" and reason ~= "kaijuTailSpin" then
+	if finalPhase and reason ~= "kaijuFireballBarrage" and reason ~= "kaijuTailSpin" then
 		-- FINALでは通常EnemyのPenalty/撃破報酬/建物全壊報酬を止め、
 		-- 怪獣攻撃だけを時間経済へ通す。
 		return 0

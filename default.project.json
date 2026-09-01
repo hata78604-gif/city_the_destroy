@@ -5,7 +5,11 @@
 
     "ReplicatedStorage": {
       "$className": "ReplicatedStorage",
-      "$path": "ReplicatedStorage"
+      "$path": "ReplicatedStorage",
+      "KaijuVFX": {
+        "$className": "Folder",
+        "$ignoreUnknownInstances": true
+      }
     },
 
     "ServerScriptService": {

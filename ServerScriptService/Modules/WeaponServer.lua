@@ -13,6 +13,7 @@ local RunService = game:GetService("RunService")
 local TweenService = game:GetService("TweenService")
 local ServerStorage = game:GetService("ServerStorage")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local CollectionService = game:GetService("CollectionService")
 
 local Config = require(ReplicatedStorage:WaitForChild("Config"))
 
@@ -43,8 +44,115 @@ local roundActive = false -- バトル中だけ発射を受け付ける
 local roundToken = 0 -- SetRoundActive(false)のたびに+1。前ラウンドの遅延攻撃を無効化する
 local airstrikeBounds = nil -- SetMapContextで受け取る数値コピー。Map Instanceは保持しない
 
--- プレイヤーごとの状態: { cooldownUntil = {武器名=時刻}, bombs = {設置爆弾}, scoreValue = IntValue }
+-- プレイヤーごとの状態。ラウンド統計もここでPlayer単位に保持する。
+-- { cooldownUntil, bombs, scoreValue, rampage, maxRampage, hitsTaken,
+--   hitCounts, destroyedBlocks }
 local playerData = {}
+local devOverrides = {}
+
+local function isDevTestEnabled()
+	return RunService:IsStudio()
+		and typeof(Config.DevTestMode) == "table"
+		and Config.DevTestMode.Enabled == true
+end
+
+local function isFiniteNumber(value)
+	return typeof(value) == "number"
+		and value == value
+		and value ~= math.huge
+		and value ~= -math.huge
+end
+
+local function isFiniteVector3(value)
+	return typeof(value) == "Vector3"
+		and isFiniteNumber(value.X)
+		and isFiniteNumber(value.Y)
+		and isFiniteNumber(value.Z)
+end
+
+local function getRampageConfig()
+	return if typeof(Config.Rampage) == "table" then Config.Rampage else {}
+end
+
+local function getRampageMinimum()
+	local config = getRampageConfig()
+	return math.max(tonumber(config.MinimumMultiplier) or 1, 1)
+end
+
+local function clampRampage(value)
+	local config = getRampageConfig()
+	local minimum = getRampageMinimum()
+	local result = math.max(tonumber(value) or minimum, minimum)
+	local maximum = tonumber(config.MaximumMultiplier)
+	if maximum and maximum >= minimum then
+		result = math.min(result, maximum)
+	end
+	return result
+end
+
+local function getInitialRampage()
+	local config = getRampageConfig()
+	return clampRampage(config.StartMultiplier)
+end
+
+-- 通常時はConfigをそのまま参照し、DevTest時だけ武器ごとの浅いコピーへ
+-- 許可されたoverrideを適用する。ネストした設定は本フェーズでは書き換えない。
+local function getWeaponConfig(weaponName)
+	local base = Config.Weapons[weaponName]
+	if typeof(base) ~= "table" then
+		return nil
+	end
+
+	if not isDevTestEnabled() then
+		return base
+	end
+	local config = table.clone(base)
+
+	local overrides = devOverrides[weaponName]
+	if typeof(overrides) == "table" then
+		for key, value in overrides do
+			config[key] = value
+		end
+	end
+	return config
+end
+
+function WeaponServer.SetDevOverride(weaponName, overrides)
+	if not isDevTestEnabled()
+		or typeof(weaponName) ~= "string"
+		or typeof(Config.Weapons[weaponName]) ~= "table"
+		or typeof(overrides) ~= "table" then
+		return false
+	end
+
+	local allowed = {}
+	for key, value in overrides do
+		if key ~= "Cooldown" and key ~= "Radius" then
+			return false
+		end
+		if not isFiniteNumber(value) or value < 0 then
+			return false
+		end
+		if key == "Cooldown" and value > 600 then
+			return false
+		end
+		if key == "Radius" and value > 200 then
+			return false
+		end
+		allowed[key] = value
+	end
+	if next(allowed) == nil then
+		return false
+	end
+
+	devOverrides[weaponName] = allowed
+	return true
+end
+
+function WeaponServer.ClearDevOverrides()
+	table.clear(devOverrides)
+	return isDevTestEnabled()
+end
 
 --------------------------------------------------------------------
 -- スコア集計
@@ -59,7 +167,20 @@ function WeaponServer.SetupPlayer(player)
 	score.Parent = stats
 	stats.Parent = player
 
-	playerData[player] = { cooldownUntil = {}, bombs = {}, scoreValue = score, scoreByCategory = {} }
+	playerData[player] = {
+		cooldownUntil = {},
+		bombs = {},
+		multiLocks = {},
+		multiLockNextId = 0,
+		lastMultiLockAt = 0,
+		scoreValue = score,
+		scoreByCategory = {},
+		rampage = getInitialRampage(),
+		maxRampage = getInitialRampage(),
+		hitsTaken = 0,
+		hitCounts = {},
+		destroyedBlocks = 0,
+	}
 end
 
 function WeaponServer.RemovePlayer(player)
@@ -85,13 +206,104 @@ function WeaponServer.AddScore(player, points, category)
 	remotes.Score:FireClient(player, data.scoreValue.Value, points)
 end
 
--- ラウンド開始時: 全員のスコアとクールダウンをリセット
+function WeaponServer.GetPlayerRampage(player)
+	local data = player and playerData[player]
+	return data and data.rampage or getInitialRampage()
+end
+
+-- RAMPAGEの増減はサーバー側だけで行う。戻り値は実際に適用された差分。
+function WeaponServer.AddRampage(player, delta, reason)
+	local data = player and playerData[player]
+	local config = getRampageConfig()
+	if not data or config.Enabled == false then
+		return 0
+	end
+
+	local numericDelta = tonumber(delta) or 0
+	if numericDelta ~= numericDelta or numericDelta == math.huge or numericDelta == -math.huge then
+		return 0
+	end
+
+	local before = clampRampage(data.rampage)
+	local after = clampRampage(before + numericDelta)
+	data.rampage = after
+	data.maxRampage = math.max(data.maxRampage or after, after)
+	local applied = after - before
+	if applied ~= 0 and remotes and remotes.Hud then
+		remotes.Hud:FireClient(player, "rampage", {
+			value = after,
+			delta = applied,
+			reason = reason,
+		})
+	end
+	return applied
+end
+
+-- Enemy/Kaijuの1ヒットを記録し、RAMPAGEだけを減らす。
+function WeaponServer.ApplyRampagePenalty(player, amount, attackType)
+	local data = player and playerData[player]
+	if not data then
+		return 0
+	end
+
+	local penalty = math.max(tonumber(amount) or 0, 0)
+	local key = if typeof(attackType) == "string" and attackType ~= "" then attackType else "Unknown"
+	data.hitsTaken += 1
+	data.hitCounts[key] = (data.hitCounts[key] or 0) + 1
+	return WeaponServer.AddRampage(player, -penalty, key)
+end
+
+function WeaponServer.RecordPlayerBlock(player)
+	local data = player and playerData[player]
+	if data then
+		data.destroyedBlocks += 1
+	end
+end
+
+function WeaponServer.GetPlayerRoundStats(player)
+	local data = player and playerData[player]
+	if not data then
+		return {
+			score = 0,
+			rampage = getInitialRampage(),
+			maxRampage = getInitialRampage(),
+			hitsTaken = 0,
+			destroyedBlocks = 0,
+			hitCounts = {},
+		}
+	end
+
+	local hitCounts = {}
+	for attackType, count in data.hitCounts do
+		hitCounts[attackType] = count
+	end
+	return {
+		score = data.scoreValue.Value,
+		rampage = data.rampage,
+		maxRampage = data.maxRampage,
+		hitsTaken = data.hitsTaken,
+		destroyedBlocks = data.destroyedBlocks,
+		hitCounts = hitCounts,
+	}
+end
+
+-- ラウンド開始時: 全員のスコア・クールダウン・RAMPAGE・破壊/被弾統計をリセット
 function WeaponServer.ResetScores()
 	for player, data in playerData do
 		data.scoreValue.Value = 0
 		data.cooldownUntil = {}
 		data.scoreByCategory = {}
+		data.rampage = getInitialRampage()
+		data.maxRampage = data.rampage
+		data.hitsTaken = 0
+		data.hitCounts = {}
+		data.destroyedBlocks = 0
 		remotes.Score:FireClient(player, 0, 0)
+		remotes.Hud:FireClient(player, "rampage", {
+			value = data.rampage,
+			delta = 0,
+			reset = true,
+		})
 	end
 end
 
@@ -134,7 +346,14 @@ end
 function WeaponServer.GetRanking()
 	local list = {}
 	for player, data in playerData do
-		table.insert(list, { name = player.DisplayName, score = data.scoreValue.Value, userId = player.UserId })
+		table.insert(list, {
+			name = player.DisplayName,
+			score = data.scoreValue.Value,
+			userId = player.UserId,
+			destroyedBlocks = data.destroyedBlocks,
+			maxRampage = data.maxRampage,
+			hitsTaken = data.hitsTaken,
+		})
 	end
 	table.sort(list, function(a, b)
 		return a.score > b.score
@@ -142,7 +361,7 @@ function WeaponServer.GetRanking()
 	return list
 end
 
--- ThreatManager用: 段階判定に使うスコアを返す(Config.Threat.ScoreSourceで合計/最高を切替)
+-- 旧Threat API互換用。現行ThreatManagerはこの値を参照しない。
 function WeaponServer.GetTotalScore()
 	if Config.Threat.ScoreSource == "top" then
 		local top = 0
@@ -165,6 +384,37 @@ function WeaponServer.GetPlayerScore(player)
 	return data and data.scoreValue.Value or 0
 end
 
+-- RAMPAGEと破壊統計の測定用ログ。数値は次回バランス調整の資料にする。
+function WeaponServer.LogRoundStats(mapStats, finalReachedAt)
+	for player, data in playerData do
+		local attackParts = {}
+		for attackType, count in data.hitCounts do
+			table.insert(attackParts, ("%s %d"):format(attackType, count))
+		end
+		table.sort(attackParts)
+		print(("[RoundStats] %s: 最終Score %d / 最大RAMPAGE x%.2f / 終了時RAMPAGE x%.2f / Player破壊 %d / 被弾 %d (%s)")
+			:format(
+				player.DisplayName,
+				data.scoreValue.Value,
+				data.maxRampage,
+				data.rampage,
+				data.destroyedBlocks,
+				data.hitsTaken,
+				table.concat(attackParts, ", ")
+			))
+	end
+
+	local stats = mapStats or {}
+	print(("[RoundStats] MAP: Player破壊 %d / NPC破壊 %d / Total破壊 %d / Total MAP破壊率 %.2f%% / FINAL到達 %.2f秒")
+		:format(
+			stats.playerDestroyed or 0,
+			stats.npcDestroyed or 0,
+			stats.totalDestroyed or 0,
+			(stats.totalRate or 0) * 100,
+			finalReachedAt or -1
+		))
+end
+
 --------------------------------------------------------------------
 -- クールダウン
 --------------------------------------------------------------------
@@ -184,7 +434,10 @@ end
 -- バズーカ: 直進する弾をサーバーで動かし、着弾点で爆発
 --------------------------------------------------------------------
 local function fireBazooka(player, data, root, targetPos)
-	local wc = Config.Weapons.Bazooka
+	local wc = getWeaponConfig("Bazooka")
+	if not wc then
+		return
+	end
 	if not isReady(data, "Bazooka") then
 		return
 	end
@@ -410,7 +663,10 @@ local function buildPlane(cf)
 end
 
 local function fireAirstrike(player, data, root, targetPos)
-	local wc = Config.Weapons.Airstrike
+	local wc = getWeaponConfig("Airstrike")
+	if not wc then
+		return
+	end
 	if not isReady(data, "Airstrike") then
 		return
 	end
@@ -512,8 +768,8 @@ end
 --------------------------------------------------------------------
 -- 同時起爆数から連鎖ボーナスの倍率を求める。
 -- ChainBonusの並び順に依存しないよう全件走査し、min <= count を満たす中で最大のminを採用する
-local function chainMultiplier(count)
-	local tiers = Config.Weapons.RemoteBomb.ChainBonus
+local function chainMultiplier(count, wc)
+	local tiers = wc.ChainBonus
 	if not tiers then
 		return 1
 	end
@@ -527,7 +783,10 @@ local function chainMultiplier(count)
 end
 
 local function placeBomb(player, data, root, targetPos)
-	local wc = Config.Weapons.RemoteBomb
+	local wc = getWeaponConfig("RemoteBomb")
+	if not wc then
+		return
+	end
 	if not Config.IsWeaponEnabled("RemoteBomb") then
 		return
 	end
@@ -577,7 +836,10 @@ local function detonateBombs(player, data)
 	if #data.bombs == 0 then
 		return
 	end
-	local wc = Config.Weapons.RemoteBomb
+	local wc = getWeaponConfig("RemoteBomb")
+	if not wc then
+		return
+	end
 	startCooldown(player, data, "RemoteBomb", wc.Cooldown)
 
 	local bombs = data.bombs
@@ -588,7 +850,7 @@ local function detonateBombs(player, data)
 	-- クリック疲れを減らすのが狙い)。倍率が掛かる先はDestructionManager.Explodeの
 	-- ctx.scoreScaleの契約に従う(ブロック破壊と市民NPC撃破のみ)
 	local count = #bombs
-	local mult = chainMultiplier(count)
+	local mult = chainMultiplier(count, wc)
 
 	-- 全弾同時起爆
 	for _, bomb in bombs do
@@ -606,6 +868,417 @@ local function detonateBombs(player, data)
 	-- ×1の表示は情報量が無く邪魔なだけなので送らない
 	if mult > 1 then
 		remotes.Hud:FireClient(player, "chain", { mult = mult, count = count })
+	end
+end
+
+--------------------------------------------------------------------
+-- マルチロックランチャー
+--
+-- ロック対象と着弾座標を分離する。NPC/Kaijuは発射時にもモデル位置を
+-- 再取得して追尾し、建物はロック時の表面座標だけを使う。
+--------------------------------------------------------------------
+local function getMultiLockFolders()
+	local map = workspace:FindFirstChild("Map")
+	local buildings = map and map:FindFirstChild("Buildings")
+	local enemies = workspace:FindFirstChild("Enemies")
+	local kaijuConfig = if typeof(Config.Kaiju) == "table" then Config.Kaiju else {}
+	local runtimeName = if typeof(kaijuConfig.RuntimeFolderName) == "string"
+		and kaijuConfig.RuntimeFolderName ~= ""
+		then kaijuConfig.RuntimeFolderName
+		else "KaijuRuntime"
+	local kaiju = workspace:FindFirstChild(runtimeName)
+	return buildings, enemies, kaiju
+end
+
+local function getTopLevelModel(instance, folder)
+	if typeof(instance) ~= "Instance" or not folder or not instance:IsDescendantOf(folder) then
+		return nil
+	end
+	local current = instance
+	while current and current.Parent ~= folder do
+		current = current.Parent
+	end
+	if current and current:IsA("Model") and current.Parent == folder then
+		return current
+	end
+	return nil
+end
+
+local function getModelPosition(model)
+	if not model or not model.Parent then
+		return nil
+	end
+	local root = model.PrimaryPart or model:FindFirstChild("HumanoidRootPart", true)
+	if root and root:IsA("BasePart") then
+		return root.Position
+	end
+	local ok, boundsCFrame = pcall(function()
+		return model:GetBoundingBox()
+	end)
+	if ok and typeof(boundsCFrame) == "CFrame" then
+		return boundsCFrame.Position
+	end
+	return nil
+end
+
+local function classifyMultiLockTarget(instance)
+	if typeof(instance) ~= "Instance" then
+		return nil
+	end
+	local buildings, enemies, kaiju = getMultiLockFolders()
+	if buildings and instance:IsA("BasePart") then
+		local building = getTopLevelModel(instance, buildings)
+		if building and CollectionService:HasTag(instance, "Destructible") and instance.CanQuery then
+			return "building", building, instance
+		end
+	end
+
+	local enemy = getTopLevelModel(instance, enemies)
+	if enemy and enemy:GetAttribute("EnemyType") ~= nil
+		and enemy:GetAttribute("Dead") ~= true
+		and enemy:GetAttribute("Deploying") ~= true then
+		return "npc", enemy, nil
+	end
+
+	local kaijuModel = getTopLevelModel(instance, kaiju)
+	if kaijuModel and kaijuModel:GetAttribute("KaijuDead") ~= true
+		and kaijuModel:GetAttribute("KaijuState") ~= "dead" then
+		return "boss", kaijuModel, nil
+	end
+	return nil
+end
+
+local function getMultiLockMaxFor(kind, model, wc)
+	if kind == "building" then
+		return math.huge
+	end
+	local value
+	if kind == "boss" then
+		value = wc.BossMaxLocks
+	elseif model and model:GetAttribute("EnemyType") == "Tank" then
+		value = wc.TankMaxLocks
+	else
+		value = wc.NPCMaxLocks
+	end
+	return math.max(math.floor(tonumber(value) or 1), 1)
+end
+
+local function getMultiLockLimit(wc)
+	return math.clamp(math.floor(tonumber(wc.MaxLocks) or 24), 1, 64)
+end
+
+local function sendMultiLockState(player, data, action, extra)
+	if not remotes or not remotes.Hud then
+		return
+	end
+	local wc = getWeaponConfig("MultiLockLauncher") or {}
+	local payload = {
+		action = action,
+		count = #(data and data.multiLocks or {}),
+		max = getMultiLockLimit(wc),
+	}
+	for key, value in extra or {} do
+		payload[key] = value
+	end
+	remotes.Hud:FireClient(player, "multiLock", payload)
+end
+
+local function isMultiLockTargetValid(lock)
+	if not lock or not lock.targetModel or not lock.targetModel.Parent then
+		return false
+	end
+	if lock.kind == "building" then
+		local kind, model, part = classifyMultiLockTarget(lock.surface)
+		return kind == "building" and model == lock.targetModel and part == lock.surface
+	end
+	local kind, model = classifyMultiLockTarget(lock.targetModel)
+	return kind == lock.kind and model == lock.targetModel
+end
+
+local function pruneMultiLocks(player, data)
+	if not data then
+		return
+	end
+	for i = #data.multiLocks, 1, -1 do
+		local lock = data.multiLocks[i]
+		if not isMultiLockTargetValid(lock) then
+			table.remove(data.multiLocks, i)
+			sendMultiLockState(player, data, "remove", { id = lock.id })
+		end
+	end
+end
+
+local function clearMultiLocks(player, data)
+	if not data then
+		return
+	end
+	table.clear(data.multiLocks)
+	sendMultiLockState(player, data, "clear")
+end
+
+local function isMultiLockEquipped(player)
+	local character = player.Character
+	if not character then
+		return false
+	end
+	for _, child in character:GetChildren() do
+		if child:IsA("Tool") and child:GetAttribute("WeaponKey") == "MultiLockLauncher" then
+			return true
+		end
+	end
+	return false
+end
+
+local function validateMultiLockRay(player, root, request, wc, target, kind, model)
+	local aimPosition = request.aimPosition
+	local rayOrigin = request.rayOrigin
+	local rayDirection = request.rayDirection
+	if not isFiniteVector3(aimPosition) or not isFiniteVector3(rayOrigin)
+		or not isFiniteVector3(rayDirection) or rayDirection.Magnitude < 0.5 then
+		return nil
+	end
+
+	local lockRange = math.max(tonumber(wc.LockRange) or 300, 1)
+	if (aimPosition - root.Position).Magnitude > lockRange then
+		return nil
+	end
+	-- Camera zoomを許容しつつ、任意の遠隔Rayを受け付けない。
+	if (rayOrigin - root.Position).Magnitude > lockRange + 200 then
+		return nil
+	end
+
+	local params = RaycastParams.new()
+	params.FilterType = Enum.RaycastFilterType.Exclude
+	params.FilterDescendantsInstances = { player.Character, projectileFolder }
+	local rayLength = math.min(lockRange + (rayOrigin - root.Position).Magnitude + 50, 1200)
+	local result = workspace:Raycast(rayOrigin, rayDirection.Unit * rayLength, params)
+	if not result or (result.Position - aimPosition).Magnitude > 4 then
+		return nil
+	end
+
+	if kind == "building" then
+		if result.Instance ~= target or not isMultiLockTargetValid({
+			kind = kind,
+			targetModel = model,
+			surface = target,
+		}) then
+			return nil
+		end
+	else
+		local resultKind, resultModel = classifyMultiLockTarget(result.Instance)
+		if resultKind ~= kind or resultModel ~= model then
+			return nil
+		end
+	end
+	return result
+end
+
+local function acquireMultiLock(player, request)
+	if not roundActive or not isMultiLockEquipped(player) then
+		return
+	end
+	local data = playerData[player]
+	local wc = getWeaponConfig("MultiLockLauncher")
+	if not data or not wc or typeof(request) ~= "table" then
+		return
+	end
+	pruneMultiLocks(player, data)
+	if #data.multiLocks >= getMultiLockLimit(wc) then
+		return
+	end
+
+	local now = os.clock()
+	local interval = math.max(tonumber(wc.LockInterval) or 0.12, 0.03)
+	if now - (data.lastMultiLockAt or 0) < math.min(interval * 0.75, interval - 0.001) then
+		return
+	end
+
+	local target = request.target
+	if typeof(target) ~= "Instance" or not target:IsDescendantOf(workspace) then
+		return
+	end
+	local kind, model, surface = classifyMultiLockTarget(target)
+	if not kind or not model then
+		return
+	end
+	local character = player.Character
+	local root = character and character:FindFirstChild("HumanoidRootPart")
+	if not root or not root:IsA("BasePart") then
+		return
+	end
+	local rayResult = validateMultiLockRay(player, root, request, wc, target, kind, model)
+	if not rayResult then
+		return
+	end
+
+	local existingForTarget = 0
+	for _, lock in data.multiLocks do
+		if lock.targetModel == model then
+			existingForTarget += 1
+			if kind == "building"
+				and (lock.aimPosition - rayResult.Position).Magnitude
+					< math.max(tonumber(wc.BuildingLockMinSpacing) or 6, 0) then
+				return
+			end
+		end
+	end
+	if existingForTarget >= getMultiLockMaxFor(kind, model, wc) then
+		return
+	end
+
+	data.lastMultiLockAt = now
+	data.multiLockNextId += 1
+	local lock = {
+		id = ("%d:%d"):format(roundToken, data.multiLockNextId),
+		kind = kind,
+		targetModel = model,
+		surface = surface,
+		aimPosition = rayResult.Position,
+		lastPosition = getModelPosition(model) or rayResult.Position,
+	}
+	table.insert(data.multiLocks, lock)
+	sendMultiLockState(player, data, "add", {
+		id = lock.id,
+		target = model,
+		surface = surface,
+		kind = kind,
+		aimPosition = lock.aimPosition,
+	})
+end
+
+local function getMultiLockLivePosition(lock)
+	if not isMultiLockTargetValid(lock) then
+		return nil
+	end
+	if lock.kind == "building" then
+		return lock.aimPosition
+	end
+	local position = getModelPosition(lock.targetModel)
+	if position then
+		lock.lastPosition = position
+		return position
+	end
+	return lock.lastPosition
+end
+
+local function fireMultiLockMissile(player, lock, wc, token, index)
+	if not roundActive or roundToken ~= token then
+		return
+	end
+	local character = player.Character
+	local root = character and character:FindFirstChild("HumanoidRootPart")
+	local targetPosition = getMultiLockLivePosition(lock)
+	if not root or not root:IsA("BasePart") or not targetPosition then
+		return
+	end
+
+	local speed = math.max(tonumber(wc.MissileSpeed) or 180, 1)
+	local turnSpeed = math.rad(math.max(tonumber(wc.TurnSpeed) or 720, 0))
+	local maxFlightTime = math.max(tonumber(wc.MaxFlightTime) or 5, 0.1)
+	local origin = root.Position + Vector3.new(0, 1.5, 0)
+	local direction = targetPosition - origin
+	if direction.Magnitude < 0.01 then
+		return
+	end
+	direction = direction.Unit
+
+	local missile = Instance.new("Part")
+	missile.Name = "MultiLockMissile"
+	missile.Shape = Enum.PartType.Ball
+	missile.Size = Vector3.new(0.7, 0.7, 0.7)
+	missile.Color = Color3.fromRGB(80, 220, 255)
+	missile.Material = Enum.Material.Neon
+	missile.Anchored = true
+	missile.CanCollide = false
+	missile.CanTouch = false
+	missile.CanQuery = false
+	missile.CFrame = CFrame.lookAt(origin, origin + direction)
+	missile.Parent = projectileFolder
+	remotes.Effect:FireAllClients("multiLockShot", { position = origin, index = index })
+
+	local params = RaycastParams.new()
+	params.FilterType = Enum.RaycastFilterType.Exclude
+	params.FilterDescendantsInstances = { character, projectileFolder }
+	local position = origin
+	local elapsed = 0
+	local impacted = false
+	while elapsed < maxFlightTime do
+		local dt = RunService.Heartbeat:Wait()
+		if not roundActive or roundToken ~= token or not missile.Parent then
+			if missile.Parent then
+				missile:Destroy()
+			end
+			return
+		end
+
+		targetPosition = getMultiLockLivePosition(lock)
+		if not targetPosition then
+			missile:Destroy()
+			return
+		end
+		local toTarget = targetPosition - position
+		if toTarget.Magnitude <= 1 then
+			position = targetPosition
+			impacted = true
+			break
+		end
+		direction = direction:Lerp(toTarget.Unit, math.clamp(turnSpeed * dt, 0, 1))
+		if direction.Magnitude < 0.01 then
+			direction = toTarget.Unit
+		else
+			direction = direction.Unit
+		end
+		local step = speed * dt
+		local result = workspace:Raycast(position, direction * step, params)
+		if result then
+			position = result.Position
+			impacted = true
+			break
+		elseif toTarget.Magnitude <= step then
+			position = targetPosition
+			impacted = true
+			break
+		end
+		position += direction * step
+		missile.CFrame = CFrame.lookAt(position, position + direction)
+		elapsed += dt
+	end
+
+	if missile.Parent then
+		missile:Destroy()
+	end
+	if impacted and roundActive and roundToken == token then
+		Destruction.Explode({
+			position = position,
+			radius = math.max(tonumber(wc.ExplosionRadius) or 6, 0),
+			attacker = player,
+			source = "MultiLockLauncher",
+		})
+	end
+end
+
+local function fireMultiLockLauncher(player, data)
+	if not roundActive or not data then
+		return
+	end
+	local wc = getWeaponConfig("MultiLockLauncher")
+	if not wc then
+		return
+	end
+	pruneMultiLocks(player, data)
+	if #data.multiLocks == 0 or not isReady(data, "MultiLockLauncher") then
+		return
+	end
+
+	startCooldown(player, data, "MultiLockLauncher", math.max(tonumber(wc.Cooldown) or 0, 0))
+	local locks = table.clone(data.multiLocks)
+	table.clear(data.multiLocks)
+	data.lastMultiLockAt = 0
+	sendMultiLockState(player, data, "clear")
+	local token = roundToken
+	local interval = math.max(tonumber(wc.MissileLaunchInterval) or 0.04, 0)
+	for index, lock in locks do
+		task.delay((index - 1) * interval, fireMultiLockMissile, player, lock, wc, token, index)
 	end
 end
 
@@ -643,10 +1316,12 @@ local function onFire(player, weaponKey, targetPos)
 		fireAirstrike(player, data, root, targetPos)
 	elseif weaponKey == "RemoteBomb" then
 		placeBomb(player, data, root, targetPos)
+	-- MultiLockLauncherはAction経由でロック/発射を受け付ける。
+	-- Fireから直接発射できないため、24ロック未満の途中状態もサーバーで保持できる。
 	end
 end
 
-local function onAction(player, action)
+local function onAction(player, action, requestData)
 	if action == "Detonate" and not Config.IsWeaponEnabled("RemoteBomb") then
 		return
 	end
@@ -656,6 +1331,12 @@ local function onAction(player, action)
 	end
 	if action == "Detonate" then
 		detonateBombs(player, data)
+	elseif action == "AcquireMultiLock" then
+		acquireMultiLock(player, requestData)
+	elseif action == "LaunchMultiLock" then
+		fireMultiLockLauncher(player, data)
+	elseif action == "CancelMultiLock" then
+		clearMultiLocks(player, data)
 	end
 end
 
@@ -696,6 +1377,8 @@ local function createToolTemplates()
 			makeHandle(tool, Vector3.new(1, 1, 4), Color3.fromRGB(70, 75, 85))
 		elseif key == "Airstrike" then
 			makeHandle(tool, Vector3.new(0.8, 1.6, 0.5), Color3.fromRGB(45, 95, 45)) -- 無線機風
+		elseif key == "MultiLockLauncher" then
+			makeHandle(tool, Vector3.new(1, 1, 3), Color3.fromRGB(50, 170, 210))
 		else
 			makeHandle(tool, Vector3.new(1.4, 1.4, 1.4), Color3.fromRGB(150, 35, 35), Enum.PartType.Ball)
 		end
@@ -825,7 +1508,10 @@ function WeaponServer.SetRoundActive(active)
 				bomb:Destroy()
 			end
 			data.bombs = {}
+			table.clear(data.multiLocks)
+			data.lastMultiLockAt = 0
 			remotes.BombCount:FireClient(player, 0)
+			sendMultiLockState(player, data, "clear")
 		end
 		-- バズーカ弾・落下爆弾・戦闘機を一括削除する。
 		-- 対応するtask/TweenはroundTokenも確認するため、次ラウンドでは爆発しない。

@@ -22,6 +22,7 @@ local deps = {
 	addTime = nil,
 	applyRampagePenalty = nil,
 	explode = nil,
+	destroyPart = nil,
 	addScore = nil,
 	hudRemote = nil,
 	onDefeated = nil,
@@ -32,6 +33,43 @@ local DEFAULT_POST_RISE_DELAY = 1
 local DEFAULT_MOVE_SPEED = 6
 local DEFAULT_STOP_DISTANCE = 10
 local DEFAULT_SUBMERGE_RATIO = 1.1
+local DEFAULT_CONTACT_INTERVAL = 0.20
+local CONTACT_MAX_PARTS = 2000
+local CONTACT_PART_CANDIDATES = {
+	leftFoot = { "LeftFoot", "LeftLowerLeg" },
+	rightFoot = { "RightFoot", "RightLowerLeg" },
+	torso = { "Torso", "UpperTorso", "LowerTorso" },
+}
+local TAIL_PART_KEYS = { "base", "mid", "tailEnd" }
+local TAIL_PART_CANDIDATES = {
+	base = { "TailBase", "Tail1" },
+	mid = { "TailMid", "Tail2" },
+	tailEnd = { "TailEnd", "Tail3" },
+}
+local TAIL_JOINT_KEYS = { "root", "mid", "tip" }
+local TAIL_JOINT_SPECS = {
+	root = {
+		motorNames = { "Tail_Root", "TailBase" },
+		part0Names = { "Torso", "UpperTorso" },
+		part1Names = { "TailBase", "Tail1" },
+	},
+	mid = {
+		motorNames = { "Tail_Mid", "TailMid" },
+		part0Names = { "TailBase", "Tail1" },
+		part1Names = { "TailMid", "Tail2" },
+	},
+	tip = {
+		motorNames = { "Tail_Tip", "TailEnd" },
+		part0Names = { "TailMid", "Tail2" },
+		part1Names = { "TailEnd", "Tail3" },
+	},
+}
+-- Motor6D Transformは各Jointの累積回転になるため、合計角度を分配して自然な曲がりにする。
+local TAIL_JOINT_WEIGHTS = {
+	root = 0.55,
+	mid = 0.30,
+	tip = 0.15,
+}
 local BOUNDS_KEYS = { "minX", "maxX", "minY", "maxY", "minZ", "maxZ" }
 
 local generation = 0
@@ -145,6 +183,23 @@ local function stopManagedAnimationTracks()
 		end)
 	end
 	table.clear(managedAnimationTracks)
+end
+
+-- TailSpinだけは、Managerが生成したTrack以外も姿勢競合の対象になる。
+-- Idle/Walk/FireBreathの通常ライフサイクルは変更せず、開始時だけ全Animatorを止める。
+local function stopAllAnimationTracks(model)
+	if not model or not model.Parent then
+		return
+	end
+	for _, instance in model:GetDescendants() do
+		if instance:IsA("Animator") then
+			for _, track in instance:GetPlayingAnimationTracks() do
+				pcall(function()
+					track:Stop(0)
+				end)
+			end
+		end
+	end
 end
 
 local function normalizeAnimationId(value)
@@ -465,6 +520,10 @@ local function nonNegative(value, fallback)
 	return math.max(value, 0)
 end
 
+local function getContactMaxBlocks(value, fallback)
+	return math.floor(math.clamp(nonNegative(value, fallback), 0, CONTACT_MAX_PARTS))
+end
+
 local function finitePositive(value)
 	return typeof(value) == "number"
 		and value == value
@@ -583,6 +642,320 @@ local function getEffectRemote()
 	return nil
 end
 
+local function resolveContactPart(model, names)
+	for _, name in names do
+		local part = model:FindFirstChild(name, true)
+		if part and part:IsA("BasePart") then
+			return part
+		end
+	end
+	return nil
+end
+
+local function nameMatches(names, instance)
+	if not instance then
+		return false
+	end
+	for _, name in names do
+		if instance.Name == name then
+			return true
+		end
+	end
+	return false
+end
+
+local function resolveTailJoint(model, spec)
+	local pairMatch = nil
+	for _, instance in model:GetDescendants() do
+		if instance:IsA("Motor6D")
+			and nameMatches(spec.part0Names, instance.Part0)
+			and nameMatches(spec.part1Names, instance.Part1) then
+			if nameMatches(spec.motorNames, instance) then
+				return instance
+			end
+			pairMatch = pairMatch or instance
+		end
+	end
+	return pairMatch
+end
+
+local function resolveTailParts(model)
+	local parts = {}
+	for _, key in TAIL_PART_KEYS do
+		parts[key] = resolveContactPart(model, TAIL_PART_CANDIDATES[key])
+	end
+	return parts
+end
+
+local function captureTailJoints(model)
+	local joints = {}
+	for _, key in TAIL_JOINT_KEYS do
+		local motor = resolveTailJoint(model, TAIL_JOINT_SPECS[key])
+		if motor then
+			table.insert(joints, {
+				key = key,
+				motor = motor,
+				baseTransform = motor.Transform,
+				weight = TAIL_JOINT_WEIGHTS[key],
+			})
+		end
+	end
+	return joints
+end
+
+local function sendTailSpinVisual(runtime, action)
+	if not runtime or not runtime.model or not runtime.model.Parent then
+		return false
+	end
+	local effectRemote = getEffectRemote()
+	if not effectRemote then
+		return false
+	end
+
+	local data = {
+		model = runtime.model,
+	}
+	if action == "start" then
+		data.startAt = workspace:GetServerTimeNow()
+		data.sweepSign = runtime.sweepSign
+		data.windupDuration = runtime.spinWindup
+		data.sweepDuration = runtime.spinSweepDuration
+		data.recoveryDuration = runtime.spinRecoveryDuration
+		data.tailWindupDegrees = runtime.spinTailWindupDegrees
+		data.bodyWindupDegrees = runtime.spinBodyWindupDegrees
+		data.sweepDegrees = runtime.spinSweepDegrees
+		data.joints = {}
+		for _, joint in runtime.tailJoints or {} do
+			local motor = joint.motor
+			if motor and motor.Parent and motor.Part0 and motor.Part1 then
+				table.insert(data.joints, {
+					name = motor.Name,
+					part0Name = motor.Part0.Name,
+					part1Name = motor.Part1.Name,
+					baseTransform = joint.baseTransform,
+					weight = joint.weight,
+				})
+			end
+		end
+	end
+
+	local ok, err = pcall(function()
+		effectRemote:FireAllClients(
+			action == "start" and "TailSpinPoseStart" or "TailSpinPoseStop",
+			data)
+	end)
+	if not ok then
+		warn(("[KaijuManager] TailSpin描画姿勢通知に失敗しました: %s"):format(tostring(err)))
+	end
+	return ok
+end
+
+local function resetTailSpinPose(runtime)
+	if not runtime then
+		return
+	end
+	if runtime.tailSpinVisualActive then
+		sendTailSpinVisual(runtime, "stop")
+		runtime.tailSpinVisualActive = false
+	end
+	for _, joint in runtime.tailJoints or {} do
+		if joint.motor and joint.motor.Parent then
+			joint.motor.Transform = joint.baseTransform
+		end
+	end
+	if runtime.spinStartCFrame and runtime.model and runtime.model.Parent then
+		runtime.model:PivotTo(runtime.spinStartCFrame)
+	end
+	-- 次のFireball/移動完了時に、過去のTailSpin開始位置へ戻さない。
+	runtime.spinStartCFrame = nil
+	runtime.spinTargetPosition = nil
+	runtime.tailJoints = nil
+	runtime.tailParts = nil
+	runtime.spinPreviousTailPoints = nil
+end
+
+local function applyTailSpinPose(runtime, tailAngle, bodyAngle)
+	if not runtime or not runtime.model or not runtime.model.Parent then
+		return
+	end
+	if runtime.spinStartCFrame then
+		runtime.model:PivotTo(runtime.spinStartCFrame * CFrame.Angles(0, math.rad(bodyAngle), 0))
+	end
+	for _, joint in runtime.tailJoints or {} do
+		if joint.motor and joint.motor.Parent then
+			joint.motor.Transform = joint.baseTransform
+				* CFrame.Angles(0, math.rad(tailAngle * joint.weight), 0)
+		end
+	end
+end
+
+local function captureTailPoints(runtime)
+	local points = {}
+	for _, key in TAIL_PART_KEYS do
+		local part = runtime.tailParts[key]
+		if part and part.Parent then
+			points[key] = {
+				position = part.Position,
+				cframe = part.CFrame,
+				size = part.Size,
+			}
+		end
+	end
+	return points
+end
+
+local function makeTailSweepBox(previous, current)
+	if not current then
+		return nil, nil
+	end
+	local previousPosition = previous and previous.position or current.position
+	local delta = current.position - previousPosition
+	local distance = delta.Magnitude
+	local center = (previousPosition + current.position) * 0.5
+	local boxCFrame = current.cframe
+	if distance > 1e-4 then
+		boxCFrame = CFrame.lookAt(center, current.position, Vector3.yAxis)
+	end
+	local boxSize = Vector3.new(
+		math.max(current.size.X, 0.1),
+		math.max(current.size.Y, 0.1),
+		math.max(current.size.Z + distance, 0.1))
+	return boxCFrame, boxSize
+end
+
+local function collectKaijuAreaParts(cframe, size, seenParts, context)
+	local map = workspace:FindFirstChild("Map")
+	if not map or map.Parent ~= workspace then
+		return {}
+	end
+
+	local params = OverlapParams.new()
+	params.FilterType = Enum.RaycastFilterType.Include
+	params.FilterDescendantsInstances = { map }
+	params.MaxParts = CONTACT_MAX_PARTS
+	local ok, hits = pcall(function()
+		return workspace:GetPartBoundsInBox(cframe, size, params)
+	end)
+	if not ok then
+		warn("[KaijuManager] Contact DestructionのOverlap検索に失敗しました: " .. tostring(hits))
+		return {}
+	end
+
+	local candidates = {}
+	for _, part in hits do
+		if not seenParts[part] then
+			seenParts[part] = true
+			table.insert(candidates, {
+				part = part,
+				distance = (part.Position - cframe.Position).Magnitude,
+				context = context,
+			})
+		end
+	end
+	table.sort(candidates, function(left, right)
+		return left.distance < right.distance
+	end)
+	return candidates
+end
+
+local function destroyKaijuCandidates(candidates, maxBlocks, context)
+	if not deps.destroyPart or maxBlocks <= 0 then
+		return 0
+	end
+
+	local destroyed = 0
+	for _, candidate in candidates do
+		if destroyed >= maxBlocks then
+			break
+		end
+		local part = candidate.part
+		if part and part.Parent then
+			local ok, didDestroy = pcall(deps.destroyPart, part, candidate.context or context)
+			if ok and didDestroy == true then
+				destroyed += 1
+			elseif not ok then
+				warn("[KaijuManager] Contact DestructionのBlock処理に失敗しました: " .. tostring(didDestroy))
+			end
+		end
+	end
+	return destroyed
+end
+
+-- TailSpinも再利用できる、指定Boxの近傍Blockを段階的に壊す共通基盤。
+local function destroyKaijuArea(cframe, size, options)
+	if typeof(cframe) ~= "CFrame" or typeof(size) ~= "Vector3" then
+		return 0
+	end
+	options = if typeof(options) == "table" then options else {}
+	local seenParts = options.seenParts or {}
+	local candidates = collectKaijuAreaParts(cframe, size, seenParts, options.context)
+	return destroyKaijuCandidates(
+		candidates,
+		getContactMaxBlocks(options.maxBlocks, #candidates),
+		options.context)
+end
+
+local function makeContactContext(cframe, size, source)
+	return {
+		position = cframe.Position,
+		radius = math.max(size.Magnitude * 0.5, 0.1),
+		attacker = nil,
+		source = source or "KaijuContact",
+		bonusPolicy = "deny",
+		silent = true,
+	}
+end
+
+local function advanceContactDestruction(runtime, dt)
+	if not isCurrent(runtime.token, runtime.model)
+		or runtime.dead
+		or not runtime.contact.enabled
+		or runtime.phase == "rise"
+		or runtime.phase == "postRise"
+		or runtime.phase == "tailSpin"
+		or runtime.phase == "dead" then
+		return
+	end
+
+	runtime.contact.elapsed += math.max(dt, 0)
+	if runtime.contact.elapsed < runtime.contact.interval then
+		return
+	end
+	runtime.contact.elapsed %= runtime.contact.interval
+	local seenParts = {}
+	local footCandidates = {}
+	if runtime.contact.footEnabled then
+		for _, part in { runtime.contact.leftFoot, runtime.contact.rightFoot } do
+			if part and part.Parent then
+				local candidates = collectKaijuAreaParts(
+					part.CFrame,
+					part.Size,
+					seenParts,
+					makeContactContext(part.CFrame, part.Size))
+				for _, candidate in candidates do
+					table.insert(footCandidates, candidate)
+				end
+			end
+		end
+		-- 左右Footは合計予算で、両足の近いBlockから選ぶ。
+		table.sort(footCandidates, function(left, right)
+			return left.distance < right.distance
+		end)
+		destroyKaijuCandidates(footCandidates, runtime.contact.footMaxBlocks)
+	end
+
+	if runtime.contact.torsoEnabled and runtime.contact.torso and runtime.contact.torso.Parent then
+		destroyKaijuArea(
+			runtime.contact.torso.CFrame,
+			runtime.contact.torso.Size,
+		{
+			seenParts = seenParts,
+			maxBlocks = runtime.contact.torsoMaxBlocks,
+			context = makeContactContext(runtime.contact.torso.CFrame, runtime.contact.torso.Size),
+		})
+	end
+end
+
 local function fireEffect(effectType, data)
 	local effectRemote = getEffectRemote()
 	if not effectRemote then
@@ -657,7 +1030,22 @@ local function setFireballCharge(runtime, enabled)
 	end
 end
 
-local function cancelFireballBarrage(runtime, cancelGeneration)
+local function getFireballOriginPosition(runtime)
+	if not runtime or not runtime.model then
+		return nil
+	end
+	local head = runtime.model:FindFirstChild("Head", true)
+	local origin = head and head:FindFirstChild("BreathOrigin", true)
+		or runtime.model:FindFirstChild("BreathOrigin", true)
+	if origin and origin:IsA("Attachment") then
+		return origin.WorldPosition
+	elseif origin and origin:IsA("BasePart") then
+		return origin.Position
+	end
+	return runtime.model:GetPivot().Position
+end
+
+local function cancelFireballBarrage(runtime, cancelGeneration, cleanupImpacts)
 	if not runtime then
 		return
 	end
@@ -666,6 +1054,7 @@ local function cancelFireballBarrage(runtime, cancelGeneration)
 		fireEffect("TargetWarningCancel", {
 			attackId = runtime.fireballAttackId,
 			generation = cancelGeneration or runtime.token,
+			cleanupImpacts = cleanupImpacts == true,
 		})
 		runtime.fireballAttackId = nil
 	end
@@ -762,7 +1151,8 @@ local function defeat(runtime, attacker)
 	runtime.model:SetAttribute("KaijuDead", true)
 	setState(runtime.model, "dead")
 	setAttackPhase(runtime.model, nil)
-	cancelFireballBarrage(runtime)
+	resetTailSpinPose(runtime)
+	cancelFireballBarrage(runtime, nil, true)
 	stopManagedAnimationTracks()
 	motionActive = false
 	activeMotion = nil
@@ -791,6 +1181,50 @@ local function addPlayerPenalty(runtime, player, amount, reason)
 	if not ok then
 		warn(("[KaijuManager] %sのRAMPAGE減少に失敗しました: %s"):format(reason, tostring(err)))
 	end
+end
+
+local function registerTailPlayerHits(runtime, boxCFrame, boxSize)
+	for _, player in Players:GetPlayers() do
+		if not runtime.spinHitPlayers[player] then
+			local character = player.Character
+			local humanoid = character and character:FindFirstChildOfClass("Humanoid")
+			local root = character and character:FindFirstChild("HumanoidRootPart")
+			if humanoid and root and root:IsA("BasePart") and humanoid.Health > 0
+				and pointToBoxDistance(root.Position, boxCFrame, boxSize) <= 1e-4 then
+				runtime.spinHitPlayers[player] = true
+				runtime.spinPlayerHits += 1
+				addPlayerPenalty(runtime, player, getRampagePenalty("KaijuTailSpin"), "KaijuTailSpin")
+			end
+		end
+	end
+end
+
+local function processTailSweepSample(runtime, previousPoints)
+	if not previousPoints or not isCurrent(runtime.token, runtime.model) then
+		return captureTailPoints(runtime), 0
+	end
+
+	local seenParts = {}
+	local destroyed = 0
+	local currentPoints = captureTailPoints(runtime)
+	for _, key in TAIL_PART_KEYS do
+		local current = currentPoints[key]
+		local previous = previousPoints[key]
+		local boxCFrame, boxSize = makeTailSweepBox(previous, current)
+		if boxCFrame and boxSize then
+			registerTailPlayerHits(runtime, boxCFrame, boxSize)
+			local remaining = runtime.spinMaxBlocksPerSample - destroyed
+			if remaining > 0 then
+				destroyed += destroyKaijuArea(boxCFrame, boxSize, {
+					seenParts = seenParts,
+					maxBlocks = remaining,
+					context = makeContactContext(boxCFrame, boxSize, "KaijuTailSpin"),
+				})
+			end
+		end
+	end
+	runtime.spinBuildingBlocksDestroyed += destroyed
+	return currentPoints, destroyed
 end
 
 local function getFireballTarget(runtime)
@@ -912,6 +1346,7 @@ local function startFireballShot(runtime, shotIndex)
 		index = shotIndex,
 		startedAt = runtime.attackElapsed,
 		impactAt = runtime.attackElapsed + runtime.fireballWarningTime,
+		origin = getFireballOriginPosition(runtime),
 		position = nil,
 		impacted = false,
 	}
@@ -922,6 +1357,7 @@ local function startFireballShot(runtime, shotIndex)
 		shot.position = resolveFireballGroundPosition(runtime, targetRoot)
 		if shot.position then
 			fireEffect("TargetWarning", {
+				origin = shot.origin,
 				position = shot.position,
 				radius = runtime.fireballExplosionRadius,
 				duration = runtime.fireballWarningTime,
@@ -939,36 +1375,11 @@ local function resolveTailSpin(runtime)
 		return
 	end
 	runtime.spinResolved = true
-	local config = getAttackConfig(getConfig(), "TailSpin")
-	local boundsCFrame = runtime.model:GetBoundingBox()
-	local center = boundsCFrame.Position
-	local radius = nonNegative(config.Radius, 0)
-	local playerHits = 0
-	for _, player in Players:GetPlayers() do
-		local character = player.Character
-		local humanoid = character and character:FindFirstChildOfClass("Humanoid")
-		local root = character and character:FindFirstChild("HumanoidRootPart")
-		if humanoid and root and root:IsA("BasePart") and humanoid.Health > 0
-			and not runtime.spinHitPlayers[player] then
-			local offset = root.Position - center
-			local horizontalDistance = Vector3.new(offset.X, 0, offset.Z).Magnitude
-			if horizontalDistance <= radius and math.abs(offset.Y) <= radius then
-				runtime.spinHitPlayers[player] = true
-				playerHits += 1
-				addPlayerPenalty(runtime, player, getRampagePenalty("KaijuTailSpin"), "KaijuTailSpin")
-			end
-		end
-	end
-	runtime.spinPlayerHits = playerHits
-
-	local blastRadius = nonNegative(config.BuildingBlastRadius, 24)
-	if blastRadius > 0 then
-		runtime.spinExplosionCount += 1
-		explodeForKaiju(runtime, center, blastRadius, "KaijuTailSpin")
-	end
 	if isCurrent(runtime.token, runtime.model) then
-		runtime.model:SetAttribute("KaijuLastTailSpinPlayerHits", playerHits)
-		runtime.model:SetAttribute("KaijuLastTailSpinExplosions", runtime.spinExplosionCount)
+		runtime.model:SetAttribute("KaijuLastTailSpinPlayerHits", runtime.spinPlayerHits)
+		runtime.model:SetAttribute("KaijuLastTailSpinBlocksDestroyed", runtime.spinBuildingBlocksDestroyed)
+		runtime.model:SetAttribute("KaijuLastTailSpinSweepSamples", runtime.spinSweepSamples)
+		runtime.model:SetAttribute("KaijuLastTailSpinSweepSign", runtime.sweepSign)
 	end
 end
 
@@ -977,6 +1388,7 @@ local function finishIdle(runtime, hasCooldown)
 		return
 	end
 
+	resetTailSpinPose(runtime)
 	cancelFireballBarrage(runtime)
 	runtime.phase = "idle"
 	runtime.thinkElapsed = 0
@@ -1029,29 +1441,56 @@ local function beginFireballBarrage(runtime, targetPlayer, targetRoot)
 	return true
 end
 
+local function resolveTailSweepSign(runtime, targetRoot, deadZone)
+	local startCFrame = runtime.model:GetPivot()
+	local localTarget = startCFrame:PointToObjectSpace(targetRoot.Position)
+	if math.abs(localTarget.X) >= deadZone then
+		return if localTarget.X >= 0 then 1 else -1
+	end
+	-- 正面/背面のDeadZoneでは、Tailの初期向きを見て毎Frame反転しないよう固定する。
+	return if localTarget.Z <= 0 then 1 else -1
+end
+
 local function beginTailSpin(runtime, targetPlayer, targetRoot)
 	if not isCurrent(runtime.token, runtime.model) then
 		return false
 	end
-	if not faceTarget(runtime, targetRoot) then
+	if not targetRoot or not targetRoot:IsA("BasePart") then
 		return false
 	end
 
 	local config = getAttackConfig(getConfig(), "TailSpin")
+	local startCFrame = runtime.model:GetPivot()
+	local deadZone = nonNegative(firstNumber(config.DirectionDeadZone, 2), 2)
 	runtime.attackTarget = targetPlayer
 	runtime.phase = "tailSpin"
 	runtime.attackElapsed = 0
 	runtime.spinElapsed = 0
-	runtime.spinWindup = nonNegative(config.Windup, 0.8)
-	runtime.spinDuration = nonNegative(config.SpinDuration, 1.2)
-	runtime.spinStartCFrame = runtime.model:GetPivot()
+	runtime.spinWindup = nonNegative(firstNumber(config.WindupDuration, config.Windup, 1.10), 1.10)
+	runtime.spinSweepDuration = nonNegative(firstNumber(config.SweepDuration, 0.70), 0.70)
+	runtime.spinRecoveryDuration = nonNegative(firstNumber(config.RecoveryDuration, 1.20), 1.20)
+	runtime.spinTailWindupDegrees = nonNegative(firstNumber(config.TailWindupDegrees, 70), 70)
+	runtime.spinBodyWindupDegrees = nonNegative(firstNumber(config.BodyWindupDegrees, 20), 20)
+	runtime.spinSweepDegrees = nonNegative(firstNumber(config.SweepDegrees, 200), 200)
+	runtime.spinMaxBlocksPerSample = getContactMaxBlocks(
+		config.MaxBlocksPerSweepSample,
+		24)
+	runtime.spinStartCFrame = startCFrame
+	runtime.spinTargetPosition = targetRoot.Position
+	runtime.sweepSign = resolveTailSweepSign(runtime, targetRoot, deadZone)
+	stopManagedAnimationTracks()
+	stopAllAnimationTracks(runtime.model)
+	runtime.tailJoints = captureTailJoints(runtime.model)
+	runtime.tailParts = resolveTailParts(runtime.model)
 	runtime.spinHitPlayers = {}
 	runtime.spinPlayerHits = 0
-	runtime.spinExplosionCount = 0
+	runtime.spinBuildingBlocksDestroyed = 0
+	runtime.spinSweepSamples = 0
+	runtime.spinPreviousTailPoints = nil
 	runtime.spinResolved = false
 	setState(runtime.model, "tailSpin")
 	setAttackPhase(runtime.model, "windup")
-	stopManagedAnimationTracks()
+	runtime.tailSpinVisualActive = sendTailSpinVisual(runtime, "start")
 	return true
 end
 
@@ -1119,31 +1558,101 @@ local function advanceFireballBarrage(runtime, dt)
 	end
 end
 
+local function smoothStep(alpha)
+	local clamped = math.clamp(alpha, 0, 1)
+	return clamped * clamped * (3 - 2 * clamped)
+end
+
+local function getTailSpinPose(runtime, elapsed)
+	local sweepStart = runtime.spinWindup
+	local sweepEnd = sweepStart + runtime.spinSweepDuration
+	local recoveryEnd = sweepEnd + runtime.spinRecoveryDuration
+	local sign = runtime.sweepSign
+	if elapsed < sweepStart then
+		local alpha = if sweepStart <= 0 then 1 else elapsed / sweepStart
+		local eased = smoothStep(alpha)
+		return -sign * runtime.spinTailWindupDegrees * eased,
+			-sign * runtime.spinBodyWindupDegrees * eased,
+			false
+	end
+	if elapsed < sweepEnd then
+		local duration = sweepEnd - sweepStart
+		local alpha = if duration <= 0 then 1 else (elapsed - sweepStart) / duration
+		local eased = smoothStep(alpha)
+		return -sign * runtime.spinTailWindupDegrees
+			+ sign * runtime.spinSweepDegrees * eased,
+			-sign * runtime.spinBodyWindupDegrees * (1 - eased),
+			true
+	end
+	local duration = recoveryEnd - sweepEnd
+	local alpha = if duration <= 0 then 1 else (elapsed - sweepEnd) / duration
+	local eased = smoothStep(alpha)
+	local sweepEndAngle = -sign * runtime.spinTailWindupDegrees
+		+ sign * runtime.spinSweepDegrees
+	return sweepEndAngle * (1 - eased), 0, false
+end
+
 local function advanceTailSpin(runtime, dt)
 	if not isCurrent(runtime.token, runtime.model) then
 		return
 	end
-	runtime.attackElapsed += dt
-	if runtime.attackElapsed < runtime.spinWindup then
+	local previousElapsed = runtime.attackElapsed
+	runtime.attackElapsed += math.max(dt, 0)
+	local sweepStart = runtime.spinWindup
+	local sweepEnd = sweepStart + runtime.spinSweepDuration
+	local recoveryEnd = sweepEnd + runtime.spinRecoveryDuration
+
+	-- 大きなdtでWindupを跨いでも、Sweep開始点からだけを判定対象にする。
+	if previousElapsed < sweepStart and runtime.attackElapsed >= sweepStart then
+		local tailAngle, bodyAngle = getTailSpinPose(runtime, sweepStart)
+		applyTailSpinPose(runtime, tailAngle, bodyAngle)
+		runtime.spinPreviousTailPoints = captureTailPoints(runtime)
+	end
+
+	if runtime.attackElapsed < sweepStart then
+		local tailAngle, bodyAngle = getTailSpinPose(runtime, runtime.attackElapsed)
+		applyTailSpinPose(runtime, tailAngle, bodyAngle)
+		setAttackPhase(runtime.model, "windup")
 		return
 	end
-	setAttackPhase(runtime.model, "spin")
-	runtime.spinElapsed = math.max(runtime.attackElapsed - runtime.spinWindup, 0)
-	local alpha = if runtime.spinDuration <= 0
-		then 1
-		else math.clamp(runtime.spinElapsed / runtime.spinDuration, 0, 1)
-	runtime.model:PivotTo(runtime.spinStartCFrame * CFrame.Angles(0, math.rad(360) * alpha, 0))
-	if alpha >= 1 then
-		-- 常に開始CFrameを最後に適用し、累積誤差を残さない。
-		runtime.model:PivotTo(runtime.spinStartCFrame)
-		resolveTailSpin(runtime)
-		if not isCurrent(runtime.token, runtime.model) then
+
+	if previousElapsed < sweepEnd then
+		local sampleElapsed = math.min(runtime.attackElapsed, sweepEnd)
+		local tailAngle, bodyAngle = getTailSpinPose(runtime, sampleElapsed)
+		applyTailSpinPose(runtime, tailAngle, bodyAngle)
+		if not runtime.spinPreviousTailPoints then
+			runtime.spinPreviousTailPoints = captureTailPoints(runtime)
+		end
+		local currentPoints, destroyed = processTailSweepSample(
+			runtime,
+			runtime.spinPreviousTailPoints)
+		runtime.spinPreviousTailPoints = currentPoints
+		runtime.spinSweepSamples += 1
+		runtime.spinLastSampleBlocksDestroyed = destroyed
+		if runtime.attackElapsed < sweepEnd then
+			runtime.spinElapsed = runtime.attackElapsed - sweepStart
+			setAttackPhase(runtime.model, "spin")
 			return
 		end
-		runtime.model:SetAttribute("KaijuLastTailSpinDegrees", 360)
-		runtime.model:SetAttribute("KaijuLastTailSpinDuration", runtime.spinElapsed)
-		finishIdle(runtime, true)
 	end
+
+	local poseElapsed = math.min(runtime.attackElapsed, recoveryEnd)
+	local tailAngle, bodyAngle = getTailSpinPose(runtime, poseElapsed)
+	applyTailSpinPose(runtime, tailAngle, bodyAngle)
+	runtime.spinElapsed = math.max(math.min(runtime.attackElapsed, sweepEnd) - sweepStart, 0)
+	if runtime.attackElapsed < recoveryEnd then
+		setAttackPhase(runtime.model, "recovery")
+		return
+	end
+
+	-- Recovery完了時に基準Transform/CFrameへ戻し、次のAttackへ姿勢を残さない。
+	resolveTailSpin(runtime)
+	if not isCurrent(runtime.token, runtime.model) then
+		return
+	end
+	runtime.model:SetAttribute("KaijuLastTailSpinDuration", runtime.spinWindup
+		+ runtime.spinSweepDuration + runtime.spinRecoveryDuration)
+	finishIdle(runtime, true)
 end
 
 local function resumeMoving(runtime)
@@ -1265,6 +1774,7 @@ function KaijuManager.Init(newDeps)
 	deps.addTime = newDeps and newDeps.addTime or nil
 	deps.applyRampagePenalty = newDeps and newDeps.applyRampagePenalty or nil
 	deps.explode = newDeps and newDeps.explode or nil
+	deps.destroyPart = newDeps and newDeps.destroyPart or nil
 	deps.addScore = newDeps and newDeps.addScore or nil
 	deps.hudRemote = newDeps and newDeps.hudRemote or nil
 	deps.onDefeated = newDeps and newDeps.onDefeated or nil
@@ -1475,6 +1985,26 @@ function KaijuManager.Start()
 		warn("[KaijuManager] " .. tostring(healthError))
 		return false
 	end
+	local contactConfig = getAttackConfig(config, "ContactDestruction")
+	local footConfig = getAttackConfig(contactConfig, "Foot")
+	local torsoConfig = getAttackConfig(contactConfig, "Torso")
+	local contactInterval = firstNumber(contactConfig.Interval, DEFAULT_CONTACT_INTERVAL)
+	if not finitePositive(contactInterval) then
+		contactInterval = DEFAULT_CONTACT_INTERVAL
+	end
+	local contactParts = {
+		leftFoot = resolveContactPart(model, CONTACT_PART_CANDIDATES.leftFoot),
+		rightFoot = resolveContactPart(model, CONTACT_PART_CANDIDATES.rightFoot),
+		torso = resolveContactPart(model, CONTACT_PART_CANDIDATES.torso),
+	}
+	if contactConfig.Enabled ~= false then
+		for partKey, names in CONTACT_PART_CANDIDATES do
+			if not contactParts[partKey] then
+				warn(("[KaijuManager] Contact Destructionの%s Partが見つかりません: %s")
+					:format(partKey, table.concat(names, ", ")))
+			end
+		end
+	end
 	local cframes, cframeError = calculateSpawnCFrames(
 		model,
 		spawnPoint,
@@ -1555,13 +2085,26 @@ function KaijuManager.Start()
 		deathHoldDuration = healthSettings.holdDuration,
 		deathFadeDuration = healthSettings.fadeDuration,
 		dead = false,
+		contact = {
+			enabled = contactConfig.Enabled ~= false,
+			interval = contactInterval,
+			elapsed = 0,
+			leftFoot = contactParts.leftFoot,
+			rightFoot = contactParts.rightFoot,
+			torso = contactParts.torso,
+			footEnabled = footConfig.Enabled ~= false,
+			footMaxBlocks = getContactMaxBlocks(footConfig.MaxBlocksPerPulse, 8),
+			torsoEnabled = torsoConfig.Enabled ~= false,
+			torsoMaxBlocks = getContactMaxBlocks(torsoConfig.MaxBlocksPerPulse, 12),
+		},
 	}
 	activeMotion = runtime
 	publishRuntimeHP(runtime, false)
 
 	heartbeatConnection = RunService.Heartbeat:Connect(function(dt)
 		if not isCurrent(token, model) then
-			cancelFireballBarrage(runtime)
+			resetTailSpinPose(runtime)
+			cancelFireballBarrage(runtime, generation, true)
 			disconnectHeartbeat()
 			motionActive = false
 			activeMotion = nil
@@ -1571,7 +2114,8 @@ function KaijuManager.Start()
 		ensurePhysics(model, runtime.rootPart)
 		local ok, err = pcall(advanceMotion, runtime, dt)
 		if not ok and isCurrent(token, model) then
-			cancelFireballBarrage(runtime)
+			resetTailSpinPose(runtime)
+			cancelFireballBarrage(runtime, nil, true)
 			stopManagedAnimationTracks()
 			motionActive = false
 			activeMotion = nil
@@ -1580,6 +2124,11 @@ function KaijuManager.Start()
 			setAttackPhase(model, nil)
 			publishRuntimeHP(runtime, false)
 			warn("[KaijuManager] 移動Heartbeatを停止しました: " .. tostring(err))
+		elseif ok and isCurrent(token, model) then
+			local contactOk, contactErr = pcall(advanceContactDestruction, runtime, dt)
+			if not contactOk and isCurrent(token, model) then
+				warn("[KaijuManager] Contact Destructionを停止しました: " .. tostring(contactErr))
+			end
 		end
 	end)
 	return true
@@ -1592,7 +2141,8 @@ function KaijuManager.Stop()
 	activeMotion = nil
 	disconnectHeartbeat()
 	if runtime then
-		cancelFireballBarrage(runtime, generation)
+		resetTailSpinPose(runtime)
+		cancelFireballBarrage(runtime, generation, true)
 	end
 	stopManagedAnimationTracks()
 	if activeModel and activeModel.Parent and activeModel:GetAttribute("KaijuDead") ~= true then
@@ -1614,7 +2164,8 @@ function KaijuManager.Clear()
 	local runtime = activeMotion
 	activeMotion = nil
 	if runtime then
-		cancelFireballBarrage(runtime, generation)
+		resetTailSpinPose(runtime)
+		cancelFireballBarrage(runtime, generation, true)
 	end
 	stopManagedAnimationTracks()
 	table.clear(animationTracks)

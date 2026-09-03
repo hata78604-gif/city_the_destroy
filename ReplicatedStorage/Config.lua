@@ -167,6 +167,19 @@ Config.Kaiju = {
 	Hitbox = {
 		SizeScale = Vector3.new(0.7, 0.9, 0.7),
 	},
+	ContactDestruction = {
+		Enabled = true,
+		Interval = 0.20,
+		Foot = {
+			Enabled = true,
+			-- 左右合計。片足だけで一度に全予算を使わないよう、Pulse内で共有する。
+			MaxBlocksPerPulse = 8,
+		},
+		Torso = {
+			Enabled = true,
+			MaxBlocksPerPulse = 12,
+		},
+	},
 	-- FireBreath animation is retained above as the windup animation asset.
 	-- The attack itself is now a fixed-position, telegraphed barrage.
 	FireballBarrage = {
@@ -177,12 +190,51 @@ Config.Kaiju = {
 		ExplosionRadius = 14,
 		PenaltySeconds = 5, -- 旧Fireball時間Penalty互換。現行値はRampage.Penalties.KaijuFireball
 		Recovery = 0.4,
+		-- VFXはEffectsClient専用。サーバーの攻撃タイミング・判定値とは分離する。
+		VFX = {
+			Projectile = {
+				LeadTime = 0.1, -- Warning開始からProjectile射出まで
+				FlightDuration = 1.1,
+				ArcHeightRatio = 0.10,
+				ArcHeightMin = 3,
+				ArcHeightMax = 12,
+				CoreSize = 1.5,
+				CoreTransparency = 0.45,
+				PointLightRange = 25,
+				PointLightBrightness = 2.5,
+				TrailLifetime = 0.35,
+			},
+			Warning = {
+				RingSegments = 16,
+				GroundTransparency = 0.86,
+				RingTransparency = 0.58,
+				CenterSize = 1.8,
+				FinalWindow = 0.15,
+			},
+			Impact = {
+				FlashDuration = 0.10,
+				ShockwaveDuration = 0.30,
+				ShockwaveRadius = 14,
+				LightRange = 38,
+				LightBrightness = 6,
+				SmokeDelay = 0.20,
+				GroundFireLifetime = 1.0,
+				Lifetime = 1.45,
+			},
+		},
 	},
 	TailSpin = {
-		Windup = 0.8,
-		SpinDuration = 1.2,
+		WindupDuration = 1.10,
+		SweepDuration = 0.70,
+		RecoveryDuration = 1.20,
+		TailWindupDegrees = 70,
+		BodyWindupDegrees = 20,
+		SweepDegrees = 200,
+		DirectionDeadZone = 2,
+		MaxBlocksPerSweepSample = 24,
 		Radius = 30,
 		PlayerPenalty = 8, -- 旧TailSpin時間Penalty互換。現行値はRampage.Penalties.KaijuTailSpin
+		-- 互換保持。TailSpinの建物判定はSweep volumeのみで、中央Explosionには使用しない。
 		BuildingBlastRadius = 24,
 	},
 	SpawnMarkerName = 'Boss03', -- 海側の既存BossSpawns。未指定時は名前順の先頭を使う。

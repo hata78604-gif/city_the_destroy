@@ -429,6 +429,24 @@ local function tryRubbleify(part, ctx)
 	return true
 end
 
+-- 範囲破壊側が近い順に選んだ単一Blockを、既存のDestruction経路へ渡す。
+-- Destructible判定・BuildingId集計・Score/RAMPAGE/NPC帰属はここで一元化する。
+function DestructionManager.DestroyPart(part, ctx)
+	if typeof(part) ~= "Instance"
+		or not part:IsA("BasePart")
+		or not part.Parent
+		or typeof(ctx) ~= "table"
+		or not CollectionService:HasTag(part, "Destructible") then
+		return false
+	end
+
+	if tryRubbleify(part, ctx) then
+		return true
+	end
+	destroyBlockReal(part, ctx)
+	return true
+end
+
 --------------------------------------------------------------------
 -- ダミー破片: 上限超過分の見た目を代替する軽量パーツ(衝突判定なし・寿命短め)
 -- 本物のブロックとは1:1に対応させず、爆発1回につき固定数だけ生成する

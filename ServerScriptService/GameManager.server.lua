@@ -204,6 +204,7 @@ KaijuManager.Init({
 	addTime = RoundClock.Add,
 	applyRampagePenalty = WeaponServer.ApplyRampagePenalty,
 	explode = DestructionManager.Explode,
+	destroyPart = DestructionManager.DestroyPart,
 	addScore = WeaponServer.AddScore,
 	hudRemote = remotes.Hud,
 	onDefeated = function(attacker)
